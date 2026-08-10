@@ -365,7 +365,7 @@ public:
 		// visible size of glyph
 		ImVec2 glyphSize;
 
-		// flag indicating if cursor is visible
+		// flag indicating if cursor is visible (based on configuration and standard blinking algorithm)
 		// this can be ignored if the custom caret has its own animation algorithm
 		bool caretVisible;
 

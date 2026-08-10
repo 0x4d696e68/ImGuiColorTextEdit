@@ -51,29 +51,14 @@ void TextEditor::setText(const std::string_view& text) {
 //
 
 bool TextEditor::render(const char* title, const ImVec2& size, ImGuiChildFlags childFlags, ImGuiWindowFlags windowFlags) {
-	// ensure we are visible
-	ImGuiWindow* parentWindow = ImGui::GetCurrentWindow();
-
-	if (parentWindow->SkipItems) {
-		return false;
-	}
-
-	// get font information
-	font = ImGui::GetFont();
-	fontSize = ImGui::GetFontSize();
-	auto& style = ImGui::GetStyle();
-	fontScaleDpi = style.FontScaleDpi;
-
-	glyphSize = ImVec2(ImGui::CalcTextSize("#").x, ImGui::GetTextLineHeightWithSpacing() * config.lineSpacing);
+	// track content state changes
+	bool documentChanged = false;
 
 	// ensure editor has focus (if required)
 	if (!firstFrame && focusOnEditor) {
 		ImGui::SetNextWindowFocus();
 		focusOnEditor = false;
 	}
-
-	// track content state changes
-	bool documentChanged = false;
 
 	// start a new child window
 	ImGui::SetNextWindowContentSize(totalSize);
@@ -85,6 +70,14 @@ bool TextEditor::render(const char* title, const ImVec2& size, ImGuiChildFlags c
 		if (firstFrame) {
 			firstFrame = false;
 		}
+
+		// get font information
+		font = ImGui::GetFont();
+		fontSize = ImGui::GetFontSize();
+		auto& style = ImGui::GetStyle();
+		fontScaleDpi = style.FontScaleDpi;
+
+		glyphSize = ImVec2(ImGui::CalcTextSize("#").x, ImGui::GetTextLineHeightWithSpacing() * config.lineSpacing);
 
 		// determine current position and visible size
 		cursorScreenPos = ImGui::GetCursorScreenPos();
@@ -207,21 +200,28 @@ bool TextEditor::render(const char* title, const ImVec2& size, ImGuiChildFlags c
 
 		// handle navigation cursor (if required)
 		if (ImGui::GetIO().ConfigFlags & (ImGuiConfigFlags_NavEnableKeyboard | ImGuiConfigFlags_NavEnableGamepad)) {
-			ImGuiContext& g = *GImGui;
+			auto window = ImGui::GetCurrentWindow();
 
 			if (ImGui::IsWindowFocused()) {
-				if (!ImGui::GetCurrentWindow()->ScrollbarY) {
+				// ImGui::BeginChildEx: we can enter a child if (A) it has navigable items or (B) it can be scrolled
+				// as a result this editor will not get a navigation border if it doesn't have a vertical scrollbar
+				// so we need to draw it ourselves in that case
+				if (!window->ScrollbarY) {
 					ImRect bb{ImGui::GetWindowPos(), ImGui::GetWindowPos() + ImGui::GetWindowSize()};
 					bb.Expand(ImVec2(2.0f, 2.0f));
 
-					bool fullyVisible = g.CurrentWindow->ClipRect.Contains(bb);
-					if (!fullyVisible) { drawList->PushClipRect(bb.Min, bb.Max); }
-					drawList->AddRect(bb.Min, bb.Max, ImGui::GetColorU32(ImGuiCol_NavCursor), g.Style.FrameRounding, fontScaleDpi);
-					if (!fullyVisible) { drawList->PopClipRect(); }
+					window->ParentWindow->DrawList->AddRect(
+						bb.Min,
+						bb.Max,
+						ImGui::GetColorU32(ImGuiCol_NavCursor),
+						ImGui::GetStyle().FrameRounding,
+						fontScaleDpi);
 				}
 
 			} else {
-				g.CurrentWindow->DC.NavLayersActiveMaskNext |= (1 << g.CurrentWindow->DC.NavLayerCurrent);
+				// this voodoo is required to get a navigation cursor when the editor is not focussed
+				// ImGui::InputTextEx: this is to ensure that EndChild() will display a navigation highlight so we can "enter" into it
+				window->DC.NavLayersActiveMaskNext |= (1 << window->DC.NavLayerCurrent);
 			}
 		}
 	}
@@ -10473,17 +10473,10 @@ ImWchar TextEditor::CodePoint::toLower(ImWchar codepoint) {
 //
 
 void TextEditor::updatePalettes() {
-	// Update palette with the current alpha from the Dear ImGui style
-	paletteAlpha = ImGui::GetStyle().Alpha;
-
+	// update palette with the current alpha from the Dear ImGui style
 	for (size_t i = 0; i < static_cast<size_t>(Color::count); i++) {
-		auto color = ImGui::ColorConvertU32ToFloat4(paletteBase[i]);
-
-		color.w *= paletteAlpha;
-		palette[i] = ImGui::ColorConvertFloat4ToU32(color);
-
-		color.w *= miniMapAlpha;
-		miniMapPalette[i] = ImGui::ColorConvertFloat4ToU32(color);
+		palette[i] = ImGui::GetColorU32(paletteBase[i]);
+		miniMapPalette[i] = ImGui::GetColorU32(paletteBase[i], miniMapAlpha);
 	}
 }
 
