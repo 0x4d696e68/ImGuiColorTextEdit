@@ -241,6 +241,11 @@ void Editor::saveFile() {
 //
 
 void Editor::render() {
+	// support language server bridge
+	if (lsp.IsRunning()) {
+		lsp.Update(filename);
+	}
+
 	// create the outer window
 	ImGuiWindowFlags windowFlags =
 		ImGuiWindowFlags_NoDecoration |
@@ -255,19 +260,45 @@ void Editor::render() {
 	// add a menubar
 	renderMenuBar();
 
-	// support language server bridge
-	if (lsp.IsRunning()) {
-		lsp.Update(filename);
-	}
-
-	// render the text editor widget
+	// determine text editor size
 	auto area = ImGui::GetContentRegionAvail();
 	auto& style = ImGui::GetStyle();
 	auto statusBarHeight = ImGui::GetFrameHeight() + 2.0f * style.WindowPadding.y;
 	auto editorSize = ImVec2(0.0f, area.y - style.ItemSpacing.y - statusBarHeight);
+
+	// render the text editor widget
 	ImGui::PushFont(nullptr, fontSize);
 	editor.Render("Text Editor", editorSize);
 	ImGui::PopFont();
+
+	// show text hover (if required)
+	if (ImGui::IsItemHovered() && showTextHover) {
+		auto mousePos = ImGui::GetMousePos();
+
+		if (editor.IsMousePosOverTextArea(mousePos)) {
+			if (editor.IsMousePosOverGlyph(mousePos) || ImGui::IsKeyDown(ImGuiMod_Shift)) {
+				// only open popup if required
+				if (!ImGui::IsPopupOpen("HoverPopup")) {
+					ImGui::OpenPopup("HoverPopup");
+				}
+
+				ImGui::SetNextWindowPos(mousePos, ImGuiCond_Always, ImVec2(0.0f, 1.0f));
+
+				if (ImGui::BeginPopup("HoverPopup", ImGuiWindowFlags_NoFocusOnAppearing)) {
+					ImGui::BringWindowToDisplayFront(ImGui::GetCurrentWindow());
+					auto docPos = editor.GetDocPosAtMousePos(mousePos);
+					auto message = std::format("DocPos: {}, {}", docPos.line, docPos.index);
+					ImGui::TextUnformatted(message.c_str());
+					ImGui::EndPopup();
+				}
+
+			} else if (ImGui::IsPopupOpen("HoverPopup")) {
+				ImGui::BeginPopup("HoverPopup");
+				ImGui::CloseCurrentPopup();
+				ImGui::EndPopup();
+			}
+		}
+	}
 
 	// render a statusbar
 	ImGui::Spacing();
@@ -496,6 +527,7 @@ void Editor::renderMenuBar() {
 			if (ImGui::MenuItem("Trie-based AutoComplete", nullptr, &demoTrieAutoComplete)) { toggleTrieAutoComplete(); }
 			if (ImGui::MenuItem("Language Server Protocol Bridge", nullptr, &demoLspBridge)) { toggleLspBridge(); }
 			if (ImGui::MenuItem("Show Word at Mouse", nullptr, &showWordAtMouse)) { toggleShowWordAtMouse(); }
+			ImGui::MenuItem("Show Text Area Hover", nullptr, &showTextHover);
 			if (ImGui::MenuItem("Show Line Markers", nullptr, &showLineMarkers)) { toggleLineMarkers(); }
 			if (ImGui::MenuItem("Show Line Decorator", nullptr, &showLineDecorator)) { toggleLineDecorator(); }
 			if (ImGui::MenuItem("Show Custom Caret", nullptr, &showCustomCaret)) { toggleCustomCaret(); }

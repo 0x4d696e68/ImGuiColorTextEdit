@@ -100,7 +100,7 @@ int example() {
 	std::copy_n("DejaVu", 7, config.Name);
 	config.FontDataOwnedByAtlas = false;
 	io.Fonts->Clear();
-	io.Fonts->AddFontFromMemoryCompressedTTF(static_cast<const void*>(&dejavu), dejavuSize, 15.0f, &config);
+	io.Fonts->AddFontFromMemoryCompressedTTF(static_cast<const void*>(&dejavu), dejavuSize, 17.0f, &config);
 
 	// main loop
 	Editor editor;

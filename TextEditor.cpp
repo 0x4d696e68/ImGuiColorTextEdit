@@ -435,7 +435,7 @@ void TextEditor::renderMatchingBracketLines() {
 //	renderSquiggle
 //
 
-inline static void renderSquiggle(float left, float right, float top, float bottom, float thickness, ImU32 color, const char* tooltip) {
+static inline void renderSquiggle(float left, float right, float top, float bottom, float thickness, ImU32 color, const char* tooltip) {
 	auto drawList = ImGui::GetWindowDrawList();
 	auto height = bottom - top;
 	auto size = height * 0.2f;
@@ -1079,7 +1079,7 @@ void TextEditor::renderPopups() {
 	}
 
 	if (ImGui::IsPopupOpen("TextHoverPopup")) {
-		ImGui::SetNextWindowPos(popUpWindowPos, ImGuiCond_Always, ImVec2(0.0f, 1.0f));
+		ImGui::SetNextWindowPos(popupWindowPos, ImGuiCond_Always, ImVec2(0.0f, 1.0f));
 
 		if (ImGui::BeginPopup("TextHoverPopup", ImGuiWindowFlags_NoFocusOnAppearing)) {
 			if (textHoverCallback) {
@@ -1626,7 +1626,7 @@ void TextEditor::handleMouseInteractions() {
 			popupDocPos = document.findWordStart(glyphPos, true);
 			auto vizPos = docPos2VisPos(popupDocPos);
 
-			popUpWindowPos = ImVec2(
+			popupWindowPos = ImVec2(
 				vizPos.column * glyphSize.x + textLeftOffset + cursorScreenPos.x,
 				vizPos.row * glyphSize.y + cursorScreenPos.y);
 
@@ -1908,17 +1908,38 @@ TextEditor::DocSelection TextEditor::getCursorSelection(size_t cursor) const {
 //
 
 bool TextEditor::isMousePosOverGlyph(const ImVec2& mousePos) const {
-	// convert mouse position to screen coordinates
-	auto local = mousePos - cursorScreenPos;
-
-	// ignore negative coordinates
-	if (local.x < 0.0f || local.y < 0.0f) {
+	if (firstFrame) {
 		return false;
-	}
 
-	// convert to visual position and check it
-	VisPos visPos(static_cast<size_t>(local.y / glyphSize.y), static_cast<size_t>((local.x - textLeftOffset) / glyphSize.x));
-	return typeSetter.isVisPosOverGlyph(visPos);
+	} else {
+		// convert mouse position to screen coordinates
+		auto local = mousePos - cursorScreenPos;
+
+		// ignore negative coordinates
+		if (local.x < 0.0f || local.y < 0.0f) {
+			return false;
+		}
+
+		// convert to visual position and check it
+		VisPos visPos(static_cast<size_t>(local.y / glyphSize.y), static_cast<size_t>((local.x - textLeftOffset) / glyphSize.x));
+		return typeSetter.isVisPosOverGlyph(visPos);
+	}
+}
+
+
+//
+//	TextEditor::isMousePosOverTextArea
+//
+
+bool TextEditor::isMousePosOverTextArea(const ImVec2& mousePos) const {
+	if (firstFrame) {
+		return false;
+
+	} else {
+		// convert mouse position to screen coordinates
+		auto local = mousePos - cursorScreenPos;
+		return local.x > textLeftOffset && local.x < textRightOffset && local.y >= 0 && local.y < textSize.y;
+	}
 }
 
 
@@ -1927,20 +1948,25 @@ bool TextEditor::isMousePosOverGlyph(const ImVec2& mousePos) const {
 //
 
 TextEditor::DocPos TextEditor::getDocPosAtMousePos(const ImVec2& mousePos) const {
-	// convert mouse position to screen coordinates
-	auto local = mousePos - cursorScreenPos;
+	if (firstFrame) {
+		return DocPos();
 
-	// ignore negative coordinates
-	if (local.y < 0.0f) {
-		return DocPos(0, 0);
+	} else {
+		// convert mouse position to screen coordinates
+		auto local = mousePos - cursorScreenPos;
 
-	} else if (local.x < 0.0f) {
-		local.x = 0.0f;
+		// ignore negative coordinates
+		if (local.y < 0.0f) {
+			return DocPos(0, 0);
+
+		} else if (local.x < 0.0f) {
+			local.x = 0.0f;
+		}
+
+		// convert to document position
+		VisPos visPos(static_cast<size_t>(local.y / glyphSize.y), static_cast<size_t>((local.x - textLeftOffset) / glyphSize.x));
+		return visPos2DocPos(normalizePos(visPos));
 	}
-
-	// convert to document position
-	VisPos visPos(static_cast<size_t>(local.y / glyphSize.y), static_cast<size_t>((local.x - textLeftOffset) / glyphSize.x));
-	return visPos2DocPos(normalizePos(visPos));
 }
 
 
@@ -8314,7 +8340,7 @@ void TextEditor::TypeSetter::screenPos2DocPos(const Document& document, ImVec2 s
 			auto leftDiff = screenPos.x - static_cast<float>(leftColumn);
 			auto rightDiff = static_cast<float>(rightColumn) - screenPos.x;
 
-			glyphPos = DocPos(row.line, index - 1);
+			glyphPos = DocPos(row.line, leftColumn == rightColumn ? index : index - 1);
 			cursorPos = DocPos(row.line, leftDiff <= rightDiff ? index - 1 : index);
 		}
 	}
