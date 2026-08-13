@@ -8314,7 +8314,8 @@ void TextEditor::TypeSetter::screenPos2DocPos(const Document& document, ImVec2 s
 			auto leftDiff = screenPos.x - static_cast<float>(leftColumn);
 			auto rightDiff = static_cast<float>(rightColumn) - screenPos.x;
 
-			glyphPos = DocPos(row.line, index - 1);
+			// when the loop above didn't run (e.g. on an empty line), there is no glyph before this position
+			glyphPos = DocPos(row.line, leftColumn == rightColumn ? index : index - 1);
 			cursorPos = DocPos(row.line, leftDiff <= rightDiff ? index - 1 : index);
 		}
 	}
