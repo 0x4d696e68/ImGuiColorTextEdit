@@ -125,7 +125,7 @@ private:
 	bool demoTrieAutoComplete = false;
 	bool demoLspBridge = false;
 	bool showWordAtMouse = false;
-	bool showTextHover = false;
+	bool showDocPosAtMouse = false;
 	bool showLineMarkers = false;
 	bool showLineDecorator = false;
 	bool showCustomCaret = false;

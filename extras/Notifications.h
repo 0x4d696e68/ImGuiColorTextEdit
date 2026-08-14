@@ -168,7 +168,6 @@ private:
 
 				ImGuiWindowFlags flags =
 					ImGuiWindowFlags_NoSavedSettings |
-					ImGuiWindowFlags_AlwaysAutoResize |
 					ImGuiWindowFlags_NoDecoration |
 					ImGuiWindowFlags_NoNav |
 					ImGuiWindowFlags_NoBringToFrontOnFocus |

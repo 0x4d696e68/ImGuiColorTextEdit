@@ -9,9 +9,10 @@
 //	Include files
 //
 
-#include <cstdio>
 #include <exception>
+#include <iostream>
 #include <filesystem>
+#include <functional>
 #include <format>
 #include <fstream>
 
@@ -271,35 +272,6 @@ void Editor::render() {
 	editor.Render("Text Editor", editorSize);
 	ImGui::PopFont();
 
-	// show text hover (if required)
-	if (ImGui::IsItemHovered() && showTextHover) {
-		auto mousePos = ImGui::GetMousePos();
-
-		if (editor.IsMousePosOverTextArea(mousePos)) {
-			if (editor.IsMousePosOverGlyph(mousePos) || ImGui::IsKeyDown(ImGuiMod_Shift)) {
-				// only open popup if required
-				if (!ImGui::IsPopupOpen("HoverPopup")) {
-					ImGui::OpenPopup("HoverPopup");
-				}
-
-				ImGui::SetNextWindowPos(mousePos, ImGuiCond_Always, ImVec2(0.0f, 1.0f));
-
-				if (ImGui::BeginPopup("HoverPopup", ImGuiWindowFlags_NoFocusOnAppearing)) {
-					ImGui::BringWindowToDisplayFront(ImGui::GetCurrentWindow());
-					auto docPos = editor.GetDocPosAtMousePos(mousePos);
-					auto message = std::format("DocPos: {}, {}", docPos.line, docPos.index);
-					ImGui::TextUnformatted(message.c_str());
-					ImGui::EndPopup();
-				}
-
-			} else if (ImGui::IsPopupOpen("HoverPopup")) {
-				ImGui::BeginPopup("HoverPopup");
-				ImGui::CloseCurrentPopup();
-				ImGui::EndPopup();
-			}
-		}
-	}
-
 	// render a statusbar
 	ImGui::Spacing();
 	renderStatusBar();
@@ -527,7 +499,7 @@ void Editor::renderMenuBar() {
 			if (ImGui::MenuItem("Trie-based AutoComplete", nullptr, &demoTrieAutoComplete)) { toggleTrieAutoComplete(); }
 			if (ImGui::MenuItem("Language Server Protocol Bridge", nullptr, &demoLspBridge)) { toggleLspBridge(); }
 			if (ImGui::MenuItem("Show Word at Mouse", nullptr, &showWordAtMouse)) { toggleShowWordAtMouse(); }
-			ImGui::MenuItem("Show Text Area Hover", nullptr, &showTextHover);
+			ImGui::MenuItem("Show DocPos at Mouse", nullptr, &showDocPosAtMouse);
 			if (ImGui::MenuItem("Show Line Markers", nullptr, &showLineMarkers)) { toggleLineMarkers(); }
 			if (ImGui::MenuItem("Show Line Decorator", nullptr, &showLineDecorator)) { toggleLineDecorator(); }
 			if (ImGui::MenuItem("Show Custom Caret", nullptr, &showCustomCaret)) { toggleCustomCaret(); }
@@ -592,50 +564,62 @@ void Editor::renderStatusBar() {
 		ImGui::EndCombo();
 	}
 
+	// support show docpos at mouse
+	std::string docPosStatus;
+
+	if (showDocPosAtMouse) {
+		auto mousePos = ImGui::GetMousePos();
+
+		if (editor.IsMousePosOverTextArea(mousePos)) {
+			if (editor.IsMousePosOverGlyph(mousePos) || ImGui::IsKeyDown(ImGuiMod_Shift)) {
+				auto docPos = editor.GetDocPosAtMousePos(mousePos);
+
+				docPosStatus = std::format(
+					"MousePos: {}, {}. DocPos: {}, {}  ",
+					mousePos.x,
+					mousePos.x,
+					docPos.line,
+					docPos.index);
+			}
+		}
+	}
+
 	// support show word at mouse
-	char word[32];
+	std::string wordStatus;
 
 	if (showWordAtMouse) {
-		auto wordAtMousePos = editor.GetWordAtMousePos(ImGui::GetMousePos());
+		auto word = editor.GetWordAtMousePos(ImGui::GetMousePos());
 
-		if (wordAtMousePos.size()) {
-			std::snprintf(word, sizeof(word), "Word: %s ", wordAtMousePos.c_str());
-
-		} else {
-			word[0] = 0;
+		if (word.size()) {
+			wordStatus = std::format("Word: {}  ", word);
 		}
-
-	} else {
-		word[0] = 0;
 	}
 
 	// determine status message
 	auto tabSize = editor.GetTabSize();
 	auto cursorPos = editor.DocPos2VisPos(editor.GetCurrentCursorPosition());
 	auto fn = std::filesystem::path(filename).filename().string();
-	char status[256];
 
-	std::snprintf(
-		status,
-		sizeof(status),
-		"%sLn %zu, Col %zu  Tab Size: %zu  File: %s",
-		word,
+	auto status = std::format(
+		"{}{}Ln {}, Col {}  Tab Size: {}  File: {}",
+		docPosStatus,
+		wordStatus,
 		cursorPos.row + 1,
 		cursorPos.column + 1,
 		tabSize,
-		fn.c_str()
+		fn
 	);
 
 	// determine horizontal gap so the rest is right aligned
 	ImGui::SameLine(0.0f, 0.0f);
 	auto availableSpace = ImGui::GetContentRegionAvail().x;
-	auto messageWidth = ImGui::CalcTextSize(status).x;
+	auto messageWidth = ImGui::CalcTextSize(status.c_str()).x;
 	auto dirtyWidth = ImGui::CalcTextSize("#").x * 3.0f;
 	ImGui::SameLine(0.0f, availableSpace - messageWidth - dirtyWidth);
 
 	// render status text
 	ImGui::AlignTextToFramePadding();
-	ImGui::TextUnformatted(status);
+	ImGui::TextUnformatted(status.c_str());
 
 	// render "text dirty" indicator
 	ImGui::SameLine(0.0f, ImGui::CalcTextSize("#").x * 1.0f);
@@ -765,7 +749,7 @@ void Editor::renderDiff() {
 		popup = false;
 	}
 
-	if (ImGui::BeginPopupModal("Changes since Opening File##diff", NULL, ImGuiWindowFlags_AlwaysAutoResize)) {
+	if (ImGui::BeginPopupModal("Changes since Opening File##diff")) {
 		diff.Render("diff", viewport->Size * 0.8f, ImGuiChildFlags_Borders);
 
 		ImGui::Separator();
@@ -864,7 +848,7 @@ void Editor::renderConfirmClose() {
 		popup = false;
 	}
 
-	if (ImGui::BeginPopupModal("Confirm Close", NULL, ImGuiWindowFlags_AlwaysAutoResize)) {
+	if (ImGui::BeginPopupModal("Confirm Close")) {
 		ImGui::Text("This file has changed!\nDo you really want to delete it?\n\n");
 		ImGui::Separator();
 
@@ -900,7 +884,7 @@ void Editor::renderConfirmQuit() {
 		popup = false;
 	}
 
-	if (ImGui::BeginPopupModal("Quit Editor?", NULL, ImGuiWindowFlags_AlwaysAutoResize)) {
+	if (ImGui::BeginPopupModal("Quit Editor?")) {
 		ImGui::Text("Your text has changed and is not saved!\nDo you really want to quit?\n\n");
 		ImGui::Separator();
 
@@ -936,7 +920,7 @@ void Editor::renderConfirmError() {
 		popup = false;
 	}
 
-	if (ImGui::BeginPopupModal("Error", NULL, ImGuiWindowFlags_AlwaysAutoResize)) {
+	if (ImGui::BeginPopupModal("Error")) {
 		ImGui::Text("%s\n", errorMessage.c_str());
 		ImGui::Separator();
 
@@ -965,7 +949,7 @@ void Editor::renderAddSquiggle() {
 		popup = false;
 	}
 
-	if (ImGui::BeginPopupModal("Add Squiggle", NULL, ImGuiWindowFlags_AlwaysAutoResize)) {
+	if (ImGui::BeginPopupModal("Add Squiggle")) {
 		auto type = static_cast<int>(squiggleType);
 		if (ImGui::SliderInt("Type", &type, 1, 5)) { squiggleType = static_cast<size_t>(type); }
 		ImGui::ColorEdit4("Color", (float*) &squiggleColor);
@@ -1013,7 +997,7 @@ void Editor::renderClearSquiggle() {
 		popup = false;
 	}
 
-	if (ImGui::BeginPopupModal("Clear Squiggles", NULL, ImGuiWindowFlags_AlwaysAutoResize)) {
+	if (ImGui::BeginPopupModal("Clear Squiggles")) {
 		auto type = static_cast<int>(squiggleType);
 		if (ImGui::SliderInt("Type", &type, 1, 5)) { squiggleType = static_cast<size_t>(type); }
 		ImGui::Separator();
@@ -1066,7 +1050,6 @@ void Editor::renderDebugInformation() {
 		ImGui::SetNextWindowPos(ImGui::GetMainViewport()->GetCenter(), ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
 
 		ImGuiWindowFlags flags =
-			ImGuiWindowFlags_AlwaysAutoResize |
 			ImGuiWindowFlags_NoDecoration |
 			ImGuiWindowFlags_NoNav |
 			ImGuiWindowFlags_NoBringToFrontOnFocus |
