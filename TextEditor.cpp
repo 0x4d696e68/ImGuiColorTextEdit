@@ -1555,9 +1555,15 @@ void TextEditor::handleMouseInteractions() {
 					// select "word" if it wasn't a bracketed section
 					// includes whitespace and operator sequences as well
 					if (!handled && !document.isEndOfLine(glyphPos)) {
-						auto start = document.findWordStart(glyphPos);
-						auto end = document.findWordEnd(glyphPos);
-						cursors.updateCurrentCursor(start, end);
+						if (document.isWordStart(glyphPos)) {
+							cursors.updateCurrentCursor(glyphPos, document.findWordEnd(glyphPos));
+
+						} else if (document.isWordEnd(glyphPos)) {
+							cursors.updateCurrentCursor(document.findWordStart(glyphPos), glyphPos);
+
+						} else {
+							cursors.updateCurrentCursor(document.findWordStart(glyphPos), document.findWordEnd(glyphPos));
+						}
 					}
 				}
 
@@ -4211,6 +4217,36 @@ void TextEditor::Document::iterateIdentifiers(std::function<void(const std::stri
 
 
 //
+//	TextEditor::Document::isWordStart
+//
+
+bool TextEditor::Document::isWordStart(DocPos pos) const {
+	if (isEndOfLine(pos)) {
+		return false;
+
+	} else {
+		auto wordStart = findWordStart(DocPos(pos.line, pos.index + 1));
+		return pos == wordStart;
+	}
+}
+
+
+//
+//	TextEditor::Document::isWordEnd
+//
+
+bool TextEditor::Document::isWordEnd(DocPos pos) const {
+	if (pos.index == 0) {
+		return false;
+
+	} else {
+		auto wordEnd = findWordEnd(DocPos(pos.line, pos.index - 1));
+		return pos == wordEnd;
+	}
+}
+
+
+//
 //	TextEditor::Document::isWholeWord
 //
 
@@ -4219,9 +4255,7 @@ bool TextEditor::Document::isWholeWord(DocPos start, DocPos end) const {
 		return false;
 
 	} else {
-		auto wordStart = findWordStart(DocPos(start.line, start.index + 1));
-		auto wordEnd = findWordEnd(DocPos(end.line, end.index - 1));
-		return start == wordStart && end == wordEnd;
+		return isWordStart(start) && isWordEnd(end);
 	}
 }
 
@@ -8270,7 +8304,7 @@ TextEditor::DocPos TextEditor::TypeSetter::visPos2DocPos(const Document& documen
 //
 
 void TextEditor::TypeSetter::screenPos2DocPos(const Document& document, ImVec2 screenPos, DocPos& glyphPos, DocPos& cursorPos) const {
-	// the returned glyphPos addresses the glyph pointed to by the screenPos parameter (row and column in floating point format)
+	// the returned glyphPos addresses the glyph pointed to by the screenPos parameter
 	// the returned cursorPos returns the closest cursor position (which can be at the start or the end of the glyph)
 	size_t colNo = static_cast<size_t>(screenPos.x);
 	size_t rowNo = static_cast<size_t>(screenPos.y);
