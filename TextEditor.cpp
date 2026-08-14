@@ -83,7 +83,13 @@ bool TextEditor::render(const char* title, const ImVec2& size, ImGuiChildFlags c
 		font = ImGui::GetFont();
 		fontSize = ImGui::GetFontSize();
 		auto& style = ImGui::GetStyle();
+#if IMGUI_VERSION_NUM >= 19200
 		fontScaleDpi = style.FontScaleDpi;
+#else
+		// Dear ImGui before 1.92 has no per-DPI font scaling, so there is nothing to follow.
+		(void) style;
+		fontScaleDpi = 1.0f;
+#endif
 		glyphSize = ImVec2(ImGui::CalcTextSize("#").x, ImGui::GetTextLineHeightWithSpacing() * config.lineSpacing);
 
 		// determine current position and visible size
@@ -1362,10 +1368,12 @@ void TextEditor::handleKeyboardInputs() {
 		if (!config.readOnly) {
 			auto context = ImGui::GetCurrentContext();
 			context->PlatformImeData.WantVisible = true;
-			context->PlatformImeData.WantTextInput = true;
 			context->PlatformImeData.InputPos = ImVec2(cursorScreenPos.x - 1.0f, cursorScreenPos.y - context->FontSize);
 			context->PlatformImeData.InputLineHeight = context->FontSize;
+#if IMGUI_VERSION_NUM >= 19200
+			context->PlatformImeData.WantTextInput = true;
 			context->PlatformImeData.ViewportId = ImGui::GetCurrentWindow()->Viewport->ID;
+#endif
 		}
 	}
 }
@@ -5235,7 +5243,7 @@ void TextEditor::renderFindReplace() {
 		// calculate sizes
 		ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(6.0f, 4.0f));
 		const auto& style = ImGui::GetStyle();
-		auto fieldWidth = 250.0f * ImGui::GetStyle().FontScaleDpi;
+		auto fieldWidth = 250.0f * fontScaleDpi;
 
 		auto button1Width = ImGui::CalcTextSize(findButtonLabel.c_str()).x + style.ItemSpacing.x * 2.0f;
 		auto button2Width = ImGui::CalcTextSize(findAllButtonLabel.c_str()).x + style.ItemSpacing.x * 2.0f;
