@@ -151,6 +151,10 @@ bool TextEditor::render(const char* title, const ImVec2& size, ImGuiChildFlags c
 		updateState();
 		handlePossibleScrolling();
 
+		// ask the app what it would put at the caret, before the keys are handled: tab inserts
+		// exactly what the last frame put on screen
+		updateInlineSuggestion();
+
 		// handle keyboard inputs
 		handleKeyboardInputs();
 		documentChanged = updateState();
@@ -191,7 +195,37 @@ bool TextEditor::render(const char* title, const ImVec2& size, ImGuiChildFlags c
 		renderTextMarkers();
 		renderMatchingBracketLines();
 		renderSquiggles();
+
+		// before the text, so what an integrator draws (colour swatches, highlights) stays
+		// behind the glyphs instead of covering them
+		if (overlayCallback) {
+			Overlay overlay;
+			overlay.drawList = drawList;
+			overlay.origin = cursorScreenPos;
+			overlay.textOffset = textLeftOffset;
+			overlay.glyphSize = glyphSize;
+			overlay.firstRow = firstVisibleRow;
+			overlay.lastRow = lastVisibleRow;
+			overlay.totalRows = typeSetter.getRowCount();
+			overlay.scrollbarMin = ImVec2(0.0f, 0.0f);
+			overlay.scrollbarMax = ImVec2(0.0f, 0.0f);
+
+			// Dear ImGui draws a window's scrollbar in Begin, before any of its content, so what
+			// a callback puts there ends up on top of it
+			auto window = ImGui::GetCurrentWindow();
+
+			if (window->ScrollbarY) {
+				auto scrollbar = ImGui::GetWindowScrollbarRect(window, ImGuiAxis_Y);
+				overlay.scrollbarMin = scrollbar.Min;
+				overlay.scrollbarMax = scrollbar.Max;
+			}
+
+			overlay.userData = overlayUserData;
+			overlayCallback(overlay);
+		}
+
 		renderText();
+		renderInlineSuggestion();
 		renderCursorCarets();
 
 		// end clipping
@@ -645,6 +679,42 @@ void TextEditor::renderText() {
 		}
 
 		rowScreenPos.y += glyphSize.y;
+	}
+}
+
+
+//
+//	TextEditor::renderInlineSuggestion
+//
+
+void TextEditor::renderInlineSuggestion() {
+	if (inlineSuggestion.size() == 0) {
+		return;
+	}
+
+	auto pos = docPos2VisPos(inlineSuggestionPos);
+
+	if (pos.row < firstVisibleRow || pos.row > lastVisibleRow) {
+		return;
+	}
+
+	// the comment color is the one shade every palette already uses for "not the code itself"
+	auto drawList = ImGui::GetWindowDrawList();
+	auto color = palette.get(Color::comment);
+	auto x = cursorScreenPos.x + textLeftOffset + pos.column * glyphSize.x;
+	auto y = cursorScreenPos.y + pos.row * glyphSize.y;
+
+	// glyph by glyph, so the ghost lines up with the grid the text is on
+	std::string_view text(inlineSuggestion);
+	auto end = text.end();
+	auto i = CodePoint::skipBOM(text.begin(), end);
+
+	while (i < end) {
+		ImWchar codepoint;
+		i = CodePoint::read(i, end, &codepoint);
+
+		font->RenderChar(drawList, fontSize, ImVec2(x, y), color, codepoint);
+		x += glyphSize.x;
 	}
 }
 
@@ -1182,6 +1252,68 @@ bool TextEditor::updateState() {
 
 
 //
+//	TextEditor::updateInlineSuggestion
+//
+
+void TextEditor::updateInlineSuggestion() {
+	inlineSuggestion.clear();
+	inlineSuggestionCaret = std::string::npos;
+
+	// a ghost only makes sense for a single caret that is not selecting anything, and the
+	// autocomplete popup already owns tab while it is up
+	if (!inlineSuggestionCallback || config.readOnly || cursors.hasMultiple() ||
+		cursors.currentCursorHasSelection() || autocomplete.isActive()) {
+
+		return;
+	}
+
+	InlineSuggestion suggestion;
+	suggestion.cursor = cursors.getCurrent().getSelectionEnd();
+	suggestion.prefix = document.getSectionText(DocPos(suggestion.cursor.line, 0), suggestion.cursor);
+	suggestion.suffix = document.getSectionText(suggestion.cursor, document.getEndOfLine(suggestion.cursor));
+	suggestion.embedded = document[suggestion.cursor.line].embedded;
+	suggestion.language = config.language;
+	suggestion.userData = inlineSuggestionUserData;
+
+	inlineSuggestionCallback(suggestion);
+
+	// a multiline suggestion would render and land on rows this does not track
+	if (suggestion.suggestion.find('\n') != std::string::npos) {
+		return;
+	}
+
+	inlineSuggestion = suggestion.suggestion;
+	inlineSuggestionCaret = suggestion.caretOffset;
+	inlineSuggestionPos = suggestion.cursor;
+}
+
+
+//
+//	TextEditor::insertInlineSuggestion
+//
+
+void TextEditor::insertInlineSuggestion() {
+	auto text = inlineSuggestion;
+	auto caret = inlineSuggestionCaret;
+	auto start = cursors.getCurrent().getSelectionEnd();
+
+	// it is gone either way: what is on screen was asked for at the start of this frame
+	inlineSuggestion.clear();
+
+	auto transaction = startTransaction();
+	auto end = insertText(transaction, start, text);
+	endTransaction(transaction);
+
+	// the suggestion is single line, so the caret offset is an index on the line it went in on
+	if (caret != std::string::npos && end.line == start.line && start.index + caret <= end.index) {
+		cursors.getCurrent().update(DocPos(start.line, start.index + caret), false);
+	}
+
+	makeCursorVisible();
+}
+
+
+//
 //	TextEditor::handleKeyboardInputs
 //
 
@@ -1277,8 +1409,8 @@ void TextEditor::handleKeyboardInputs() {
 		else if (!config.readOnly && ImGui::Shortcut(ImGuiMod_Alt | ImGuiKey_UpArrow)) { moveUpLines(); }
 		else if (!config.readOnly && ImGui::Shortcut(ImGuiMod_Alt | ImGuiKey_DownArrow)) { moveDownLines(); }
 
-		else if (!config.readOnly && config.language && ImGui::Shortcut(ImGuiMod_Ctrl | ImGuiKey_Slash)) { toggleComments(); }
-		else if (!config.readOnly && config.language && ImGui::Shortcut(ImGuiMod_Ctrl | ImGuiKey_L)) { toggleComments(); }
+		// note: comment toggling has no key of its own here on purpose - the integrator binds it,
+		// so it shows up in its own shortcut settings and can be remapped like the rest
 
 		// find/replace support
 		else if (ImGui::Shortcut(ImGuiMod_Ctrl | ImGuiKey_F)) {
@@ -1290,7 +1422,9 @@ void TextEditor::handleKeyboardInputs() {
 			openFindReplace();
 		}
 
-		else if (ImGui::Shortcut(ImGuiMod_Ctrl | ImGuiMod_Shift | ImGuiKey_F)) { findAll(); }
+		// note: Ctrl+Shift+F has no binding here on purpose - selecting every occurrence in this
+		// file is the Find All button, and the chord belongs to whatever the integrator uses for
+		// searching across files
 		else if (ImGui::Shortcut(ImGuiMod_Ctrl | ImGuiKey_G, ImGuiInputFlags_Repeat)) { findNext(); }
 
 		// autocomplete support
@@ -1321,7 +1455,10 @@ void TextEditor::handleKeyboardInputs() {
 
 		// handle tabs
 		else if (!config.readOnly && ImGui::Shortcut(ImGuiKey_Tab, ImGuiInputFlags_Repeat)) {
-			if (cursors.anyHasSelection()) {
+			if (inlineSuggestion.size()) {
+				insertInlineSuggestion();
+
+			} else if (cursors.anyHasSelection()) {
 				indentLines();
 
 			} else {
@@ -1469,14 +1606,23 @@ void TextEditor::handleMouseInteractions() {
 			scrollY = std::clamp(scrollY, 0.0f, totalSize.y - textSize.y);
 			ImGui::SetScrollY(scrollY);
 
-		} else if (selectingText && overLineNumbers) {
+		// a drag that has started follows the mouse wherever it goes: over the line numbers, past
+		// the end of the text, out of the editor and out of the window. screenPos2DocPos clamps
+		// to the document, and because the position it clamps is relative to the text origin -
+		// which moves with the scroll - holding the mouse past an edge keeps scrolling by itself
+		} else if (boxSelecting) {
+			// dragging with alt+shift held keeps rebuilding the box from the same anchor
+			makeBoxSelection(boxSelectAnchor, docPos2VisPos(cursorPos));
+			makeCursorVisible();
+
+		} else if (selectingLines) {
 			auto& cursor = cursors.getCurrent();
 			auto start = DocPos(cursorPos.line, 0);
 			auto end = normalizePos(DocPos(cursorPos.line + 1, 0));
 			cursor.update(cursor.getInteractiveEnd() < cursor.getInteractiveStart() ? start : end);
 			makeCursorVisible();
 
-		} else if (selectingText && overText) {
+		} else if (selectingText) {
 			cursors.updateCurrentCursor(cursorPos);
 			makeCursorVisible();
 		}
@@ -1485,6 +1631,8 @@ void TextEditor::handleMouseInteractions() {
 	} else if (ImGui::IsMouseReleased(ImGuiMouseButton_Left)) {
 		miniMapIsScrollbar = false;
 		selectingText = false;
+		selectingLines = false;
+		boxSelecting = false;
 
 	// ignore other interactions when the editor is not hovered
 	} else if (ImGui::IsWindowHovered()) {
@@ -1517,6 +1665,7 @@ void TextEditor::handleMouseInteractions() {
 		} else if (ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
 			// handle left mouse button actions
 			selectingText = overText || overLineNumbers;
+			selectingLines = overLineNumbers;
 			auto doubleClick = ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left);
 			auto now = static_cast<float>(ImGui::GetTime());
 			auto tripleClick = !doubleClick && lastClickTime != -1.0f && (now - lastClickTime) < io.MouseDoubleClickTime;
@@ -1583,6 +1732,10 @@ void TextEditor::handleMouseInteractions() {
 					? ImGui::IsKeyDown(ImGuiMod_Alt) :
 					ImGui::IsKeyDown(ImGuiMod_Ctrl);
 
+				// alt+shift is a box selection, which is a shift click as far as the modifiers go
+				// and so has to be asked about first
+				auto boxSelect = ImGui::IsKeyDown(ImGuiMod_Alt) && extendCursor;
+
 				if (overLineNumbers) {
 					// handle line number clicks
 					auto start = DocPos(cursorPos.line, 0);
@@ -1605,7 +1758,15 @@ void TextEditor::handleMouseInteractions() {
 
 				} else if (overText) {
 					// handle mouse clicks in text
-					if (extendCursor) {
+					if (boxSelect) {
+						// from where the caret already was down to where the click landed
+						boxSelecting = true;
+						selectingText = false;
+						selectingLines = false;
+						boxSelectAnchor = docPos2VisPos(cursors.getMain().getInteractiveEnd());
+						makeBoxSelection(boxSelectAnchor, docPos2VisPos(cursorPos));
+
+					} else if (extendCursor) {
 						cursors.growCurrentCursor(cursorPos);
 						autocomplete.cancel();
 
@@ -1664,6 +1825,44 @@ void TextEditor::handleMouseInteractions() {
 			navigatingVertically = false;
 		}
 	}
+}
+
+
+//
+//	TextEditor::makeBoxSelection
+//
+
+void TextEditor::makeBoxSelection(VisPos anchor, VisPos position) {
+	// one cursor per row between the two, all of them spanning the same columns
+	// rows rather than lines so that the box is what it looks like when lines are wrapped
+	auto firstRow = std::min(anchor.row, position.row);
+	auto lastRow = std::max(anchor.row, position.row);
+	auto leftColumn = std::min(anchor.column, position.column);
+	auto rightColumn = std::max(anchor.column, position.column);
+
+	// the caret goes on the side that was clicked, and rows are walked from the anchor towards
+	// the click so the last cursor made (the current one) is the one under the mouse
+	auto forward = position.column >= anchor.column;
+	auto startColumn = forward ? leftColumn : rightColumn;
+	auto endColumn = forward ? rightColumn : leftColumn;
+	auto down = position.row >= anchor.row;
+
+	for (size_t i = 0; i <= lastRow - firstRow; i++) {
+		auto row = down ? firstRow + i : lastRow - i;
+
+		// short lines just get a caret at their end, which is where visPos2DocPos clamps to
+		auto start = visPos2DocPos(VisPos(row, startColumn));
+		auto end = visPos2DocPos(VisPos(row, endColumn));
+
+		if (i == 0) {
+			cursors.setCursor(start, end);
+
+		} else {
+			cursors.addCursor(start, end);
+		}
+	}
+
+	autocomplete.cancel();
 }
 
 
@@ -1815,6 +2014,14 @@ void TextEditor::shrinkSelections() {
 void TextEditor::cut() {
 	// copy selections to clipboard and remove them
 	copy();
+
+	// an empty cursor copies its whole line (see copy), so that is what has to go,
+	// the newline that ends it included - deleting an empty selection removes nothing
+	if (!cursors.anyHasSelection()) {
+		removeSelectedLines();
+		return;
+	}
+
 	auto transaction = startTransaction();
 	deleteTextFromAllCursors(transaction);
 	cursors.getCurrent().resetToStart();
@@ -1852,6 +2059,10 @@ void TextEditor::copy() const {
 	}
 
 	ImGui::SetClipboardText(text.c_str());
+
+	// remember that this was a whole line (see paste)
+	clipboardIsLine = !cursors.anyHasSelection() && !cursors.hasMultiple();
+	clipboardText = text;
 }
 
 
@@ -1863,11 +2074,35 @@ void TextEditor::paste() {
 	// ignore non-text clipboard content
 	auto clipboard = ImGui::GetClipboardText();
 
-	if (clipboard) {
-		auto transaction = startTransaction();
-		insertTextIntoAllCursors(transaction, clipboard);
-		endTransaction(transaction);
+	if (!clipboard) {
+		return;
 	}
+
+	// the platform layer may have put the text on the clipboard with CRLF line endings
+	// (SDL does on Windows), and it comes back that way - insertText drops the returns anyway
+	std::string pasted(clipboard);
+	pasted.erase(std::remove(pasted.begin(), pasted.end(), '\r'), pasted.end());
+
+	// a copy made without a selection took the entire line, newline included
+	// dropping that back in at the cursor would cut the line in two, so it goes in as whole
+	// lines above the cursor instead - what every other editor does with a line copy
+	if (clipboardIsLine && !cursors.anyHasSelection() && !cursors.hasMultiple() && clipboardText == pasted) {
+		auto cursor = cursors.getCurrent().getSelectionStart();
+		auto lines = std::count(clipboardText.begin(), clipboardText.end(), '\n');
+
+		auto transaction = startTransaction();
+		insertText(transaction, DocPos(cursor.line, 0), clipboardText);
+
+		// the cursor stays on its own text, which has moved down by what was inserted
+		cursors.getCurrent().update(DocPos(cursor.line + static_cast<size_t>(lines), cursor.index), false);
+		endTransaction(transaction);
+		makeCursorVisible();
+		return;
+	}
+
+	auto transaction = startTransaction();
+	insertTextIntoAllCursors(transaction, pasted);
+	endTransaction(transaction);
 }
 
 
@@ -2776,7 +3011,21 @@ void TextEditor::moveDownLines() {
 
 void TextEditor::toggleComments() {
 	auto transaction = startTransaction();
-	auto comment = config.language->singleLineComment;
+
+	// see if a line carries the given text at the given glyph index
+	auto matchesAt = [this](size_t line, size_t index, const std::string& text) {
+		if (text.empty() || index + text.size() > document[line].size()) {
+			return false;
+		}
+
+		for (size_t i = 0; i < text.size(); i++) {
+			if (document[line][index + i].codepoint != static_cast<ImWchar>(text[i])) {
+				return false;
+			}
+		}
+
+		return true;
+	};
 
 	// process all cursors
 	for (auto cursor = cursors.begin(); cursor < cursors.end(); cursor++) {
@@ -2786,34 +3035,90 @@ void TextEditor::toggleComments() {
 		// process all lines in this cursor
 		for (auto line = cursorStart.line; line <= cursorEnd.line; line++) {
 			if ((!cursor->hasSelection() || DocPos(line, 0) != cursorEnd) && document[line].size()) {
-				// see if line starts with a comment (after possible leading whitespaces)
+				// a line inside an embedded region comments the way that language does, not the
+				// way the host does - /* */ inside an HTML <style> block, <!-- --> outside it
+				auto language = (document[line].embedded && config.language->embedded) ? config.language->embedded : config.language;
+				auto comment = language->singleLineComment;
+
+				// skip leading whitespace
 				size_t start = 0;
-				size_t i = 0;
 
 				while (start < document[line].size() && CodePoint::isWhiteSpace(document[line][start].codepoint)) {
 					start++;
 				}
 
-				while (start + i < document[line].size() && i < comment.size() && document[line][start + i].codepoint == static_cast<ImWchar>(comment[i])) {
-					i++;
-				}
+				if (comment.size()) {
+					// single line comment: toggle the prefix
+					if (matchesAt(line, start, comment)) {
+						auto deleteStart = DocPos(line, start);
+						auto endOfComment = start + comment.size();
 
-				if (i == comment.size()) {
-					auto deleteStart = DocPos(line, start);
-					auto endOfComment = start + i;
+						if (endOfComment < document[line].size() - 1 && document[line][endOfComment].codepoint == ' ') {
+							endOfComment++;
+						}
 
-					if (endOfComment < document[line].size() - 1 && document[line][endOfComment].codepoint == ' ') {
-						endOfComment++;
+						auto deleteEnd = DocPos(line, endOfComment);
+						deleteText(transaction, deleteStart, deleteEnd);
+						cursors.adjustForDelete(cursor, deleteStart, deleteEnd, true);
+
+					} else {
+						auto insertStart = DocPos(line, start);
+						auto insertEnd = insertText(transaction, insertStart, comment + " ");
+						cursors.adjustForInsert(cursor, insertStart, insertEnd, true);
 					}
 
-					auto deleteEnd = DocPos(line, endOfComment);
-					deleteText(transaction, deleteStart, deleteEnd);
-					cursors.adjustForDelete(cursor, deleteStart, deleteEnd, true);
+				} else if (language->commentStart.size() && language->commentEnd.size()) {
+					// block comment: wrap the line's text, ignoring the whitespace around it
+					size_t finish = document[line].size();
 
-				} else {
-					auto insertStart = DocPos(line, start);
-					auto insertEnd = insertText(transaction, insertStart, comment + " ");
-					cursors.adjustForInsert(cursor, insertStart, insertEnd, true);
+					while (finish > start && CodePoint::isWhiteSpace(document[line][finish - 1].codepoint)) {
+						finish--;
+					}
+
+					if (finish == start) {
+						continue;
+					}
+
+					auto& commentStart = language->commentStart;
+					auto& commentEnd = language->commentEnd;
+
+					auto wrapped = finish >= start + commentStart.size() + commentEnd.size() &&
+						matchesAt(line, start, commentStart) &&
+						matchesAt(line, finish - commentEnd.size(), commentEnd);
+
+					if (wrapped) {
+						// the closing token first: taking the opening one out would move it
+						auto endOfText = finish - commentEnd.size();
+
+						if (endOfText > start + commentStart.size() && document[line][endOfText - 1].codepoint == ' ') {
+							endOfText--;
+						}
+
+						auto deleteStart = DocPos(line, endOfText);
+						auto deleteEnd = DocPos(line, finish);
+						deleteText(transaction, deleteStart, deleteEnd);
+						cursors.adjustForDelete(cursor, deleteStart, deleteEnd, true);
+
+						auto startOfText = start + commentStart.size();
+
+						if (startOfText < document[line].size() && document[line][startOfText].codepoint == ' ') {
+							startOfText++;
+						}
+
+						deleteStart = DocPos(line, start);
+						deleteEnd = DocPos(line, startOfText);
+						deleteText(transaction, deleteStart, deleteEnd);
+						cursors.adjustForDelete(cursor, deleteStart, deleteEnd, true);
+
+					} else {
+						auto insertStart = DocPos(line, finish);
+						auto insertEnd = insertText(transaction, insertStart, " " + commentEnd);
+						cursors.adjustForInsert(cursor, insertStart, insertEnd, true);
+
+						insertStart = DocPos(line, start);
+						insertEnd = insertText(transaction, insertStart, commentStart + " ");
+						cursors.adjustForInsert(cursor, insertStart, insertEnd, true);
+					}
 				}
 			}
 		}
@@ -4613,7 +4918,7 @@ bool TextEditor::Colorizer::matches(Line::iterator start, Line::iterator end, co
 //	TextEditor::Colorizer::updateLine
 //
 
-TextEditor::LineState TextEditor::Colorizer::updateLine(Line& line) {
+TextEditor::LineState TextEditor::Colorizer::updateLine(Line& line, bool& embedded) {
 	// initialize local variables
 	auto state = line.state;
 	auto nonWhiteSpace = false;
@@ -4623,20 +4928,47 @@ TextEditor::LineState TextEditor::Colorizer::updateLine(Line& line) {
 
 	// process all glyphs on this line
 	while (glyph < end) {
+		// the language in force here: inside an embedded region (e.g. a <style> block in HTML)
+		// every rule below comes from the embedded language until its closing token shows up
+		auto active = (embedded && language->embedded) ? language->embedded : language;
+
 		// start parsing glyphs
 		auto start = glyph;
 		Iterator tokenStart(&*glyph);
 
 		if (state == LineState::inText) {
+			// does an embedded region open or close here
+			// only tested at the top level of a line: a region marker inside a comment or a
+			// string is text like any other
+			if (language->embedded) {
+				Iterator tokenEnd = tokenStart;
+
+				if (embedded) {
+					if (language->embeddedEnd && (tokenEnd = language->embeddedEnd(tokenStart, lineEnd)) != tokenStart) {
+						embedded = false;
+					}
+
+				} else if (language->embeddedStart && (tokenEnd = language->embeddedStart(tokenStart, lineEnd)) != tokenStart) {
+					embedded = true;
+				}
+
+				if (tokenEnd != tokenStart) {
+					auto size = tokenEnd - tokenStart;
+					setColor(glyph, glyph + size, Color::keyword);
+					glyph += size;
+					continue;
+				}
+			}
+
 			// special handling for preprocessor lines
-			if (!nonWhiteSpace && language->preprocess && glyph->codepoint != language->preprocess && !CodePoint::isWhiteSpace(glyph->codepoint)) {
+			if (!nonWhiteSpace && active->preprocess && glyph->codepoint != active->preprocess && !CodePoint::isWhiteSpace(glyph->codepoint)) {
 				nonWhiteSpace = true;
 			}
 
 			// are we starting a multilevel, multiline comment
-			if (language->commentLevelStart) {
+			if (active->commentLevelStart) {
 				size_t level;
-				Iterator tokenEnd = language->commentLevelStart(tokenStart, lineEnd, level);
+				Iterator tokenEnd = active->commentLevelStart(tokenStart, lineEnd, level);
 
 				if (tokenEnd != tokenStart) {
 					level = std::min(level, maxCommentLevel);
@@ -4648,9 +4980,9 @@ TextEditor::LineState TextEditor::Colorizer::updateLine(Line& line) {
 			}
 
 			// are we starting a multilevel, multiline string
-			if (glyph == start && language->stringLevelStart) {
+			if (glyph == start && active->stringLevelStart) {
 				size_t level;
-				Iterator tokenEnd = language->stringLevelStart(tokenStart, lineEnd, level);
+				Iterator tokenEnd = active->stringLevelStart(tokenStart, lineEnd, level);
 
 				if (tokenEnd != tokenStart) {
 					level = std::min(level, maxStringLevel);
@@ -4667,46 +4999,46 @@ TextEditor::LineState TextEditor::Colorizer::updateLine(Line& line) {
 					(glyph++)->color = Color::whitespace;
 
 				// are we starting a multiline comment
-				} else if (language->commentStart.size() && matches(glyph, end, language->commentStart)) {
+				} else if (active->commentStart.size() && matches(glyph, end, active->commentStart)) {
 					state = LineState::inComment;
-					auto size = language->commentStart.size();
+					auto size = active->commentStart.size();
 					setColor(glyph, glyph + size, Color::comment);
 					glyph += size;
 
 				// handle single line comments
-				} else if (language->singleLineComment.size() && matches(glyph, end, language->singleLineComment)) {
+				} else if (active->singleLineComment.size() && matches(glyph, end, active->singleLineComment)) {
 					setColor(glyph, end, Color::comment);
 					glyph = end;
 
-				} else if (language->singleLineCommentAlt.size() && matches(glyph, end, language->singleLineCommentAlt)) {
+				} else if (active->singleLineCommentAlt.size() && matches(glyph, end, active->singleLineCommentAlt)) {
 					setColor(glyph, end, Color::comment);
 					glyph = end;
 
 				// are we starting a special string
-				} else if (language->otherStringStart.size() && matches(glyph, end, language->otherStringStart)) {
+				} else if (active->otherStringStart.size() && matches(glyph, end, active->otherStringStart)) {
 					state = LineState::inOtherString;
-					auto size = language->otherStringStart.size();
+					auto size = active->otherStringStart.size();
 					setColor(glyph, glyph + size, Color::string);
 					glyph += size;
 
-				} else if (language->otherStringAltStart.size() && matches(glyph, end, language->otherStringAltStart)) {
+				} else if (active->otherStringAltStart.size() && matches(glyph, end, active->otherStringAltStart)) {
 					state = LineState::inOtherStringAlt;
-					auto size = language->otherStringAltStart.size();
+					auto size = active->otherStringAltStart.size();
 					setColor(glyph, glyph + size, Color::string);
 					glyph += size;
 
 				// are we starting a single quoted string
-				} else if (language->hasSingleQuotedStrings && glyph->codepoint == CodePoint::singleQuote) {
+				} else if (active->hasSingleQuotedStrings && glyph->codepoint == CodePoint::singleQuote) {
 					state = LineState::inSingleQuotedString;
 					(glyph++)->color = Color::string;
 
 				// are we starting a double quoted string
-				} else if (language->hasDoubleQuotedStrings && glyph->codepoint == CodePoint::doubleQuote) {
+				} else if (active->hasDoubleQuotedStrings && glyph->codepoint == CodePoint::doubleQuote) {
 					state = LineState::inDoubleQuotedString;
 					(glyph++)->color = Color::string;
 
 				// is this a preprocessor line
-				} else if (language->preprocess && !nonWhiteSpace && glyph->codepoint == language->preprocess) {
+				} else if (active->preprocess && !nonWhiteSpace && glyph->codepoint == active->preprocess) {
 					setColor(line.begin(), end, Color::preprocessor);
 					glyph = end;
 				}
@@ -4718,13 +5050,13 @@ TextEditor::LineState TextEditor::Colorizer::updateLine(Line& line) {
 				Iterator tokenEnd;
 
 				// handle custom tokenizer (if we have one)
-				if (language->customTokenizer&& (tokenEnd = language->customTokenizer(tokenStart, lineEnd, color)) != tokenStart) {
+				if (active->customTokenizer&& (tokenEnd = active->customTokenizer(tokenStart, lineEnd, color)) != tokenStart) {
 					auto size = tokenEnd - tokenStart;
 					setColor(glyph, glyph + size, color);
 					glyph += size;
 
 				// do we have an identifier
-				} else if (language->getIdentifier && (tokenEnd = language->getIdentifier(tokenStart, lineEnd)) != tokenStart) {
+				} else if (active->getIdentifier && (tokenEnd = active->getIdentifier(tokenStart, lineEnd)) != tokenStart) {
 					// determine identifier text and color
 					auto size = tokenEnd - tokenStart;
 					std::string identifier;
@@ -4733,7 +5065,7 @@ TextEditor::LineState TextEditor::Colorizer::updateLine(Line& line) {
 					for (auto i = tokenStart; i < tokenEnd; i++) {
 						ImWchar codepoint = *i;
 
-						if (!language->caseSensitive) {
+						if (!active->caseSensitive) {
 							codepoint = CodePoint::toLower(codepoint);
 						}
 
@@ -4741,13 +5073,13 @@ TextEditor::LineState TextEditor::Colorizer::updateLine(Line& line) {
 						identifier.append(utf8, CodePoint::write(utf8, codepoint));
 					}
 
-					if (language->keywords.find(identifier) != language->keywords.end()) {
+					if (active->keywords.find(identifier) != active->keywords.end()) {
 						color = Color::keyword;
 
-					} else if (language->declarations.find(identifier) != language->declarations.end()) {
+					} else if (active->declarations.find(identifier) != active->declarations.end()) {
 						color = Color::declaration;
 
-					} else if (language->identifiers.find(identifier) != language->identifiers.end()) {
+					} else if (active->identifiers.find(identifier) != active->identifiers.end()) {
 						color = Color::knownIdentifier;
 					}
 
@@ -4756,13 +5088,13 @@ TextEditor::LineState TextEditor::Colorizer::updateLine(Line& line) {
 					glyph += size;
 
 				// do we have a number
-				} else if (language->getNumber && (tokenEnd = language->getNumber(tokenStart, lineEnd)) != tokenStart) {
+				} else if (active->getNumber && (tokenEnd = active->getNumber(tokenStart, lineEnd)) != tokenStart) {
 					auto size = tokenEnd - tokenStart;
 					setColor(glyph, glyph + size, Color::number);
 					glyph += size;
 
 				// is this punctuation
-				} else if (language->isPunctuation && language->isPunctuation(glyph->codepoint)) {
+				} else if (active->isPunctuation && active->isPunctuation(glyph->codepoint)) {
 					(glyph++)->color = Color::punctuation;
 
 				} else {
@@ -4773,16 +5105,16 @@ TextEditor::LineState TextEditor::Colorizer::updateLine(Line& line) {
 
 		} else if (lineStateInComment(state)) {
 			// stay in comment state until we see the end sequence
-			auto size = language->commentEnd.size();
+			auto size = active->commentEnd.size();
 
-			if (size && matches(glyph, end, language->commentEnd)) {
+			if (size && matches(glyph, end, active->commentEnd)) {
 				setColor(glyph, glyph + size, Color::comment);
 				glyph += size;
 				state = LineState::inText;
 
-			} else if (language->commentLevelEnd) {
+			} else if (active->commentLevelEnd) {
 				size_t level;
-				Iterator tokenEnd = language->commentLevelEnd(tokenStart, lineEnd, level);
+				Iterator tokenEnd = active->commentLevelEnd(tokenStart, lineEnd, level);
 
 				if (tokenEnd != tokenStart) {
 					level = std::min(level, maxCommentLevel);
@@ -4803,7 +5135,7 @@ TextEditor::LineState TextEditor::Colorizer::updateLine(Line& line) {
 		} else if (lineStateInStringLevel(state)) {
 			// stay in string level until matching closing is detected
 			size_t level;
-			Iterator tokenEnd = language->stringLevelEnd(tokenStart, lineEnd, level);
+			Iterator tokenEnd = active->stringLevelEnd(tokenStart, lineEnd, level);
 
 			if (tokenEnd != tokenStart) {
 				level = std::min(level, maxStringLevel);
@@ -4825,15 +5157,15 @@ TextEditor::LineState TextEditor::Colorizer::updateLine(Line& line) {
 		} else if (state == LineState::inOtherString) {
 			// stay in otherString state until we see the end sequence
 			// skip escaped characters
-			if (glyph->codepoint == language->stringEscape) {
+			if (glyph->codepoint == active->stringEscape) {
 				(glyph++)->color = Color::string;
 
 				if (glyph < end) {
 					(glyph++)->color = Color::string;
 				}
 
-			} else if (matches(glyph, end, language->otherStringEnd)) {
-				auto size = language->otherStringEnd.size();
+			} else if (matches(glyph, end, active->otherStringEnd)) {
+				auto size = active->otherStringEnd.size();
 				setColor(glyph, glyph + size, Color::string);
 				glyph += size;
 				state = LineState::inText;
@@ -4845,15 +5177,15 @@ TextEditor::LineState TextEditor::Colorizer::updateLine(Line& line) {
 		} else if (state == LineState::inOtherStringAlt) {
 			// stay in otherStringAlt state until we see the end sequence
 			// skip escaped characters
-			if (glyph->codepoint == language->stringEscape) {
+			if (glyph->codepoint == active->stringEscape) {
 				(glyph++)->color = Color::string;
 
 				if (glyph < end) {
 					(glyph++)->color = Color::string;
 				}
 
-			} else if (matches(glyph, end, language->otherStringAltEnd)) {
-				auto size = language->otherStringAltEnd.size();
+			} else if (matches(glyph, end, active->otherStringAltEnd)) {
+				auto size = active->otherStringAltEnd.size();
 				setColor(glyph, glyph + size, Color::string);
 				glyph += size;
 				state = LineState::inText;
@@ -4865,7 +5197,7 @@ TextEditor::LineState TextEditor::Colorizer::updateLine(Line& line) {
 		} else if (state == LineState::inSingleQuotedString) {
 			// stay in single quote state until we see an end
 			// skip escaped characters
-			if (glyph->codepoint == language->stringEscape) {
+			if (glyph->codepoint == active->stringEscape) {
 				(glyph++)->color = Color::string;
 
 				if (glyph < end) {
@@ -4883,7 +5215,7 @@ TextEditor::LineState TextEditor::Colorizer::updateLine(Line& line) {
 		} else if (state == LineState::inDoubleQuotedString) {
 			// stay in double quote state until we see an end
 			// skip escaped characters
-			if (glyph->codepoint == language->stringEscape) {
+			if (glyph->codepoint == active->stringEscape) {
 				(glyph++)->color = Color::string;
 
 				if (glyph < end) {
@@ -4916,8 +5248,11 @@ bool TextEditor::Colorizer::update(const Config& config, Document& document) {
 		language = config.language;
 
 		if (language) {
+			bool embedded = false;
+
 			for (auto line = document.begin(); line < document.end(); line++) {
-				auto state = updateLine(*line);
+				line->embedded = embedded;
+				auto state = updateLine(*line, embedded);
 				line->needsColorizing = false;
 				auto next = line + 1;
 
@@ -4933,6 +5268,7 @@ bool TextEditor::Colorizer::update(const Config& config, Document& document) {
 				}
 
 				line->state = LineState::inText;
+				line->embedded = false;
 				line->needsColorizing = false;
 			}
 		}
@@ -4942,12 +5278,16 @@ bool TextEditor::Colorizer::update(const Config& config, Document& document) {
 		for (auto line = document.begin(); line < document.end(); line++) {
 			if (line->needsColorizing) {
 				if (language) {
-					auto state = updateLine(*line);
+					bool embedded = line->embedded;
+					auto state = updateLine(*line, embedded);
 					line->needsColorizing = false;
 					auto next = line + 1;
 
-					if (next < document.end() && next->state != state) {
+					// an edit that opens or closes an embedded region changes what every line
+					// below it is, so the flag propagates the same way the comment state does
+					if (next < document.end() && (next->state != state || next->embedded != embedded)) {
 						next->state = state;
+						next->embedded = embedded;
 						next->needsColorizing = true;
 					}
 
@@ -4957,6 +5297,7 @@ bool TextEditor::Colorizer::update(const Config& config, Document& document) {
 					}
 
 					line->state = LineState::inText;
+					line->embedded = false;
 					line->needsColorizing = false;
 				}
 			}
@@ -8606,10 +8947,6 @@ bool TextEditor::AutoComplete::render(Document& document, Cursors& cursors, Type
 	bool result = false;
 	auto pos = typesetter.docPos2VisPos(document, currentLocation);
 
-	ImGui::SetNextWindowPos(ImVec2(
-		ImGui::GetCursorScreenPos().x + textOffset + pos.column * glyphSize.x,
-		ImGui::GetCursorScreenPos().y + (pos.row + 1) * glyphSize.y));
-
 	auto suggestions = state.suggestions.size();
 
 	// an empty result while typing dismisses silently; only a manual trigger earns the "no suggestions" feedback
@@ -8620,7 +8957,27 @@ bool TextEditor::AutoComplete::render(Document& document, Cursors& cursors, Type
 	auto visibleSuggestions = (suggestions == 0) ? 1 : std::min(static_cast<size_t>(10), suggestions);
 	const auto& style = ImGui::GetStyle();
 	auto height = ImGui::GetFrameHeightWithSpacing() * visibleSuggestions + style.WindowPadding.y * 2.0f;
-	ImGui::SetNextWindowSize(ImVec2(configuration.suggestionWidth * glyphSize.x, height));
+	auto width = configuration.suggestionWidth * glyphSize.x;
+
+	// the popup is placed and sized here, so it also has to be kept inside the host window:
+	// with multi-viewport enabled, a popup that hangs over the edge is given a platform window
+	// of its own, and an integrator has no say over whether those are actually shown
+	auto origin = ImGui::GetCursorScreenPos();
+	auto viewport = ImGui::GetMainViewport();
+	auto right = std::max(viewport->WorkPos.x, viewport->WorkPos.x + viewport->WorkSize.x - width);
+	auto bottom = std::max(viewport->WorkPos.y, viewport->WorkPos.y + viewport->WorkSize.y - height);
+	auto x = std::min(origin.x + textOffset + pos.column * glyphSize.x, right);
+	auto y = origin.y + (pos.row + 1) * glyphSize.y;
+
+	if (y > bottom) {
+		// above the line being typed on instead, the way an editor flips its suggestion list
+		auto above = origin.y + pos.row * glyphSize.y - height;
+		y = (above >= viewport->WorkPos.y) ? above : bottom;
+	}
+
+	ImGui::SetNextWindowPos(ImVec2(x, y));
+	ImGui::SetNextWindowSize(ImVec2(width, height));
+	ImGui::SetNextWindowViewport(viewport->ID);
 
 	ImGuiWindowFlags flags =
 		ImGuiWindowFlags_NoFocusOnAppearing |

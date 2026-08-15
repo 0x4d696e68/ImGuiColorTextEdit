@@ -614,6 +614,15 @@ public:
 		// if a token is found, function should return an iterator to the character after the token and set the color
 		std::function<Iterator(Iterator start, Iterator end, Color& color)> customTokenizer;
 
+		// embedded language support (e.g. CSS inside an HTML <style> block)
+		// the two tokenizers detect where such a region opens and closes in the host language
+		// everything in between is colored (and commented) as the embedded language, across lines
+		// functions should return an iterator to the character after the detected token
+		// returning start means no token was found
+		const Language* embedded = nullptr;
+		std::function<Iterator(Iterator start, Iterator end)> embeddedStart;
+		std::function<Iterator(Iterator start, Iterator end)> embeddedEnd;
+
 		// predefined language definitions
 		static const Language* C();
 		static const Language* Cpp();
@@ -720,6 +729,70 @@ public:
 	// provide autocomplete suggestions asynchronously (in case a callback takes to long and lookup is handled in a separate thread/process)
 	// this call is not threadsafe and must be called from the rendering thread (you must synchronize with your lookup thread yourself)
 	inline void SetAutoCompleteSuggestions(const std::vector<std::string>& suggestions) { autocomplete.setSuggestions(suggestions); }
+
+	// see if the autocomplete popup is up (it owns tab, enter and the arrow keys while it is)
+	inline bool IsAutoCompleteActive() const { return autocomplete.isActive(); }
+
+	// inline suggestion (ghost text) support
+	// the callback is called once per frame with the text around the caret and may fill in a suggestion
+	// the suggestion is rendered dimmed at the caret and inserted when the user hits tab
+	// it is only asked for when there is a single cursor without a selection and autocomplete is not up
+	struct InlineSuggestion {
+		// context (all strings are UTF-8 encoded)
+		DocPos cursor;
+		std::string prefix; // what is on the caret's line before the caret
+		std::string suffix; // what is on it after the caret
+		bool embedded;      // caret sits inside an embedded language region (see Language::embedded)
+		const Language* language;
+		void* userData;
+
+		// what the app wants inserted (empty means no suggestion)
+		std::string suggestion;
+
+		// where the caret ends up, in glyphs from the insert point (npos puts it at the end)
+		// suggestions are single line: a newline in one would put the caret on the wrong row
+		size_t caretOffset = std::string::npos;
+	};
+
+	inline void SetInlineSuggestionCallback(std::function<void(InlineSuggestion&)> callback, void* userData=nullptr) {
+		inlineSuggestionCallback = callback;
+		inlineSuggestionUserData = userData;
+	}
+
+	inline void ClearInlineSuggestionCallback() { SetInlineSuggestionCallback(nullptr); }
+	inline bool HasInlineSuggestion() const { return inlineSuggestion.size() != 0; }
+
+	// custom overlay rendering
+	// the callback runs just before the text is drawn, so what it draws stays behind the glyphs
+	// and is clipped to the text area like everything else in there
+	struct Overlay {
+		ImDrawList* drawList;
+		ImVec2 origin;    // screen position of the top left of the editor's content
+		float textOffset; // distance from the origin to the first glyph column
+		ImVec2 glyphSize;
+		size_t firstRow; // visible rows, so a callback only has to look at what is on screen
+		size_t lastRow;
+		size_t totalRows; // rows in the whole document, which is what the scrollbar spans
+
+		// the vertical scrollbar's track, for a callback that marks places in the document the
+		// way the mini map does (equal corners when the document fits and there is no scrollbar)
+		// it is outside the clip rect the text area uses, so a callback drawing there has to
+		// push its own
+		ImVec2 scrollbarMin;
+		ImVec2 scrollbarMax;
+
+		void* userData;
+	};
+
+	inline void SetOverlayRenderer(std::function<void(const Overlay&)> callback, void* userData=nullptr) {
+		overlayCallback = callback;
+		overlayUserData = userData;
+	}
+
+	inline void ClearOverlayRenderer() { SetOverlayRenderer(nullptr); }
+
+	// see if a line starts inside an embedded language region (see Language::embedded)
+	inline bool IsLineEmbedded(size_t line) const { return document[normalizeLine(line)].embedded; }
 
 	// support functions for unicode codepoints
 	struct CodePoint {
@@ -978,6 +1051,9 @@ protected:
 		// color state maintained by the Colorizer overlay
 		bool needsColorizing = true;
 		LineState state = LineState::inText;
+
+		// set when this line starts inside an embedded language region (see Language::embedded)
+		bool embedded = false;
 
 		// line folding state maintained by the LineFold overlay
 		FoldingState foldingState = FoldingState::visible;
@@ -1287,7 +1363,9 @@ protected:
 
 	private:
 		// update color in a single line
-		LineState updateLine(Line& line);
+		// embedded is in/out: it says whether the line starts inside an embedded region
+		// and comes back saying whether the next line does
+		LineState updateLine(Line& line, bool& embedded);
 
 		// see if string matches part of line
 		static bool matches(Line::iterator start, Line::iterator end, const std::string_view& text);
@@ -1575,6 +1653,7 @@ protected:
 	void renderMatchingBracketLines();
 	void renderSquiggles();
 	void renderText();
+	void renderInlineSuggestion();
 	void renderCursorCarets();
 	void renderLineNumberMarkers();
 	void renderLineNumbers();
@@ -1589,9 +1668,14 @@ protected:
 	// update editor state after changes caused by API calls or user interactions
 	bool updateState();
 
+	// ask the app for a ghost suggestion at the caret, and put the last one into the document
+	void updateInlineSuggestion();
+	void insertInlineSuggestion();
+
 	// keyboard and mouse interactions
 	void handleKeyboardInputs();
 	void handleMouseInteractions();
+	void makeBoxSelection(VisPos anchor, VisPos position);
 
 	// check visibility of a document position
 	bool isDocPosVisible(DocPos pos) const;
@@ -1780,6 +1864,16 @@ protected:
 
 	std::function<void(const CustomCaret&)> customCaretCallback;
 
+	// ghost text at the caret: what the app suggested this frame, and where tab puts the caret
+	std::function<void(InlineSuggestion&)> inlineSuggestionCallback;
+	void* inlineSuggestionUserData = nullptr;
+	std::string inlineSuggestion;
+	size_t inlineSuggestionCaret = std::string::npos;
+	DocPos inlineSuggestionPos;
+
+	std::function<void(const Overlay&)> overlayCallback;
+	void* overlayUserData = nullptr;
+
 	std::function<void(PopupData& data)> lineNumberContextMenuCallback;
 	std::function<void(PopupData& data)> textContextMenuCallback;
 	std::function<void(PopupData& data)> textHoverCallback;
@@ -1797,6 +1891,12 @@ protected:
 	bool findCancelledAutocomplete = false;
 	std::string findText;
 	std::string replaceText;
+
+	// what the last copy put on the clipboard, and whether it was a whole line
+	// (a copy without a selection takes the line and its newline, so a paste has to put it
+	// back as a line instead of splitting the one the cursor is on)
+	mutable std::string clipboardText;
+	mutable bool clipboardIsLine = false;
 	bool caseSensitiveFind = false;
 	bool wholeWordFind = false;
 
@@ -1809,6 +1909,17 @@ protected:
 	bool scrolling = false;
 	ImVec2 scrollStart;
 	bool selectingText = false;
+
+	// whether that selection started on the line numbers, which is what makes it a line
+	// selection. Latched at the click: a drag keeps doing what it set out to do wherever it
+	// goes, including outside the editor
+	bool selectingLines = false;
+
+	// box (column) selection with alt+shift, anchored on where the cursor was when it started
+	// so that dragging keeps rebuilding the same box
+	bool boxSelecting = false;
+	VisPos boxSelectAnchor;
+
 	bool deletesHappened = false;
 	std::function<void()> delayedChangeCallback;
 	std::chrono::milliseconds delayedChangeDelay;
