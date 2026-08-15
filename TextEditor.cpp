@@ -1549,6 +1549,19 @@ void TextEditor::handleMouseInteractions() {
 
 	panning &= config.panMode && ImGui::IsMouseDown(ImGuiMouseButton_Middle);
 
+	// the shape of the pointer is decided here rather than inside the chain below: a drag, a
+	// release and a plain hover each take a branch of their own, and any frame that misses the
+	// call falls back to the arrow - a single frame of it at the release is what the pointer
+	// blinking on a click is. a selection already under way keeps the shape it started with,
+	// wherever it has been dragged to (past the end of the text, over the line numbers, out of
+	// the window), so a line selection stays an arrow and a text one an I-beam; the flags still
+	// hold last frame's state at this point, which is what covers the release frame.
+	auto selectingInText = (selectingText && !selectingLines) || boxSelecting;
+
+	if (selectingInText || (!selectingLines && overText && ImGui::IsWindowHovered() && ImGui::IsWindowFocused())) {
+		ImGui::SetMouseCursor(ImGuiMouseCursor_TextInput);
+	}
+
 	// handle middle mouse button panning
 	if (panning && ImGui::IsMouseDragging(ImGuiMouseButton_Middle)) {
 		auto windowSize = ImGui::GetWindowSize();
@@ -1636,11 +1649,6 @@ void TextEditor::handleMouseInteractions() {
 
 	// ignore other interactions when the editor is not hovered
 	} else if (ImGui::IsWindowHovered()) {
-		// show text cursor if required
-		if (ImGui::IsWindowFocused() && overText) {
-			ImGui::SetMouseCursor(ImGuiMouseCursor_TextInput);
-		}
-
 		if (ImGui::IsMouseClicked(ImGuiMouseButton_Middle)) {
 			// start panning/scrolling mode on middle mouse click
 			if (config.panMode) {
