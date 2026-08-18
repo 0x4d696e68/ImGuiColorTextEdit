@@ -43,6 +43,13 @@ void TextEditor::setText(const std::string_view& text) {
 	clearMarkers();
 	clearSquiggles();
 	resetScrolling();
+
+	// a mouse gesture that was in flight belongs to the text that just went away; without
+	// this, the next drag frame would rebuild a selection from coordinates of the old text
+	selectingText = false;
+	selectingLines = false;
+	boxSelecting = false;
+	caretPastPadding = DocPos(invalidLine, 0);
 }
 
 
@@ -171,6 +178,10 @@ bool TextEditor::render(const char* title, const ImVec2& size, ImGuiChildFlags c
 		// update color palette (if required)
 		if (paletteAlpha != style.Alpha) {
 			updatePalettes();
+
+			// the palettes are also resolved per language now, so this stops being a per-frame
+			// walk of them; everything that feeds them invalidates this
+			paletteAlpha = style.Alpha;
 		}
 
 		// determine width of cursor
@@ -346,11 +357,14 @@ void TextEditor::renderSelections() {
 			auto begin = cursor.getSelectionStart();
 			auto end = cursor.getSelectionEnd();
 
-			for (size_t i = begin.line; i <= end.line; i++) {
+			// a selection can outlive the lines it covered for a frame; don't walk off the document
+			auto lastLine = std::min(end.line, document.size() - 1);
+
+			for (size_t i = begin.line; i <= lastLine; i++) {
 				const auto& line = document[i];
 
 				if (line.foldingState != FoldingState::hidden) {
-					if (line.rows == 1) {
+					if (line.rows == 1 || !line.sections) {
 						if (line.row >= firstVisibleRow && line.row <= lastVisibleRow) {
 							auto lineLeft = DocPos(i, 0);
 							auto lineRight =DocPos(i, line.size());
@@ -543,6 +557,9 @@ void TextEditor::renderSquiggles() {
 			while (column < endColumn && column <= lastVisibleColumn) {
 				auto& glyph = line[index++];
 				auto codepoint = glyph.codepoint;
+
+				column += glyph.padding;
+
 				ImVec2 glyphPos(rowScreenPos.x + column * glyphSize.x, rowScreenPos.y);
 
 				// handle squiggles
@@ -608,6 +625,11 @@ void TextEditor::renderText() {
 	for (size_t i = firstVisibleRow; i <= lastVisibleRow; i++) {
 		// determine visible boundaries for this row
 		auto& line = document[typeSetter[i].line];
+
+		// the glyphs of a line are drawn in the palette of the language that line is in, which is
+		// the host language unless it starts inside an embedded region (see SetLanguagePalette)
+		auto& glyphPalette = linePalette(line);
+
 		size_t index;
 		size_t column;
 		size_t endColumn;
@@ -628,6 +650,10 @@ void TextEditor::renderText() {
 		while (column < endColumn && column <= lastVisibleColumn) {
 			auto& glyph = line[index++];
 			auto codepoint = glyph.codepoint;
+
+			// cells reserved for an overlay to draw in sit in front of the glyph and stay empty
+			column += glyph.padding;
+
 			ImVec2 glyphPos(rowScreenPos.x + column * glyphSize.x, rowScreenPos.y);
 
 			// handle tabs
@@ -663,7 +689,7 @@ void TextEditor::renderText() {
 			// handle regular glyphs
 			} else {
 				if (column >= firstRenderableColumn) {
-					font->RenderChar(drawList, fontSize, glyphPos, palette.get(glyph.color), codepoint);
+					font->RenderChar(drawList, fontSize, glyphPos, glyphPalette.get(glyph.color), codepoint);
 				}
 
 				column++;
@@ -736,6 +762,12 @@ void TextEditor::renderCursorCarets() {
 
 			if (document[docPos.line].foldingState != FoldingState::hidden) {
 				auto pos = docPos2VisPos(docPos);
+
+				// the click that put the caret here put it behind the cells reserved in front of
+				// the glyph rather than in front of them (see caretPastPadding)
+				if (docPos == caretPastPadding) {
+					pos.column += paddingAt(docPos);
+				}
 
 				if (pos.row >= firstVisibleRow && pos.row <= lastVisibleRow && pos.column >= firstVisibleColumn && pos.column <= lastVisibleColumn) {
 					auto caretVisible = !io.ConfigInputTextCursorBlink || cursorAnimationTimer <= 0.0f || std::fmod(cursorAnimationTimer, 1.2f) <= 0.8f;
@@ -839,15 +871,19 @@ void TextEditor::renderDecorations() {
 		Decorator decorator{0, widthInPixels, glyphSize.y, glyphSize, nullptr};
 
 		for (size_t i = firstVisibleRow; i <= lastVisibleRow; i++) {
+			// only the first row of a line carries its decoration, but every row moves the pen:
+			// with word wrap on, a line taking two rows would otherwise pull everything under it
+			// up by one row (and the user data is a line's, not a row's)
 			if (typeSetter[i].section == 0) {
 				decorator.line = typeSetter[i].line;
-				decorator.userData = document.getUserData(i);
+				decorator.userData = document.getUserData(typeSetter[i].line);
 				ImGui::SetCursorScreenPos(position);
 				ImGui::PushID(static_cast<int>(i));
 				decoratorCallback(decorator);
 				ImGui::PopID();
-				position.y += glyphSize.y;
 			}
+
+			position.y += glyphSize.y;
 		}
 
 		ImGui::SetCursorScreenPos(cursorScreenPos);
@@ -1174,7 +1210,10 @@ void TextEditor::renderPopups() {
 	if (autocomplete.render(document, cursors, typeSetter, config.language, textLeftOffset, glyphSize)) {
 		// user picked a suggestion so insert it
 		auto start = autocomplete.getStart();
-		auto end = document.findWordEnd(start, true);
+
+		// the same rule the term was read back with: with "-" in it, `font-si` accepting
+		// `font-size` has to replace the whole of it and not just the `font` in front of the dash
+		auto end = autocomplete.findTermEnd(document, start);
 		auto replacement = autocomplete.getReplacement();
 		replaceSectionText(start, end, replacement);
 	}
@@ -1189,6 +1228,11 @@ bool TextEditor::updateState() {
 	// this function gets called to handle possible changes caused by the API or user interactions
 	// the overlays determine what they need to do to update their state (could be nothing)
 	colorizer.update(config, document);
+
+	// after the colorizer, because what a line reserves can depend on the language it is in
+	// (a colour is a colour inside a <style> block and an id selector outside one), and before
+	// the type setter, which is what turns the reservations into columns
+	updateGlyphPadding();
 	bracketeer.update(config, document);
 	lineFold.update(config, document, bracketeer);
 	cursors.update(document);
@@ -1252,6 +1296,34 @@ bool TextEditor::updateState() {
 
 
 //
+//	TextEditor::updateGlyphPadding
+//
+
+void TextEditor::updateGlyphPadding() {
+	// only lines that are about to be type-set anyway are asked: a line that did not change
+	// reserves what it reserved last time, and the values live in the glyphs themselves
+	if (!glyphPaddingCallback || !document.isUpdated()) {
+		return;
+	}
+
+	for (size_t i = 0; i < document.size(); i++) {
+		auto& line = document[i];
+
+		if (!line.needsTypeSetting) {
+			continue;
+		}
+
+		glyphPaddingBuffer.assign(line.size(), 0);
+		glyphPaddingCallback(i, document.getLineText(i), glyphPaddingBuffer, glyphPaddingUserData);
+
+		for (size_t j = 0; j < line.size() && j < glyphPaddingBuffer.size(); j++) {
+			line[j].padding = glyphPaddingBuffer[j];
+		}
+	}
+}
+
+
+//
 //	TextEditor::updateInlineSuggestion
 //
 
@@ -1271,7 +1343,7 @@ void TextEditor::updateInlineSuggestion() {
 	suggestion.cursor = cursors.getCurrent().getSelectionEnd();
 	suggestion.prefix = document.getSectionText(DocPos(suggestion.cursor.line, 0), suggestion.cursor);
 	suggestion.suffix = document.getSectionText(suggestion.cursor, document.getEndOfLine(suggestion.cursor));
-	suggestion.embedded = document[suggestion.cursor.line].embedded;
+	suggestion.embedded = document[suggestion.cursor.line].embedded != 0;
 	suggestion.language = config.language;
 	suggestion.userData = inlineSuggestionUserData;
 
@@ -1376,7 +1448,11 @@ void TextEditor::handleKeyboardInputs() {
 		else if (ImGui::Shortcut(ImGuiMod_Shift | ImGuiKey_End)) { moveToEndOfLine(true); }
 
 		else if (ImGui::Shortcut(ImGuiMod_Ctrl | ImGuiKey_A)) { selectAll(); }
-		else if (cursors.currentCursorHasSelection() && ImGui::Shortcut(ImGuiMod_Ctrl | ImGuiKey_D)) { addNextOccurrence(); }
+		// note: Ctrl+D has no binding here on purpose - adding the next occurrence to the cursors
+		// is AddNextOccurrence() for the integrator to bind, and the chord itself is the one an
+		// editor gives to duplicating the line or the selection, which the integrator also has to
+		// do (a selection duplicated here would still be a selection when this ran, and both would
+		// happen on the one key)
 		else if (cursors.currentCursorHasSelection() && ImGui::Shortcut(ImGuiMod_Ctrl | ImGuiMod_Shift | ImGuiKey_D)) { selectAllOccurrences(); }
 
 		// clipboard operations
@@ -1458,10 +1534,13 @@ void TextEditor::handleKeyboardInputs() {
 			if (inlineSuggestion.size()) {
 				insertInlineSuggestion();
 
-			} else if (cursors.anyHasSelection()) {
+			} else if (cursors.anyHasSelection() && !selectionsAreBlanksOnly()) {
 				indentLines();
 
 			} else {
+				// a selection holding nothing but blanks is an indent the user is replacing, so it
+				// goes through the regular insert (which drops the selection first) and becomes one
+				// tab instead of pushing the line right and leaving the old blanks behind
 				handleCharacter('\t');
 			}
 		}
@@ -1546,6 +1625,23 @@ void TextEditor::handleMouseInteractions() {
 		ImVec2((mousePos.x - textLeftOffset) / glyphSize.x, mousePos.y / glyphSize.y),
 		glyphPos,
 		cursorPos);
+
+	// the cells reserved in front of a glyph (see SetGlyphPaddingCallback) hold no glyph, so the
+	// position in front of them and the position behind them are the same position in the
+	// document: which side of what an overlay draws there the caret goes on is the click's to
+	// say, and it says it by which half of those cells it landed in. anything to the right of
+	// their middle - the glyph itself included - puts the caret against the glyph
+	auto clickPastPadding = false;
+
+	if (auto padding = paddingAt(cursorPos); padding != 0) {
+		auto column = static_cast<float>(docPos2VisPos(cursorPos).column);
+		clickPastPadding = (mousePos.x - textLeftOffset) / glyphSize.x >= column + static_cast<float>(padding) * 0.5f;
+	}
+
+	// only a click or a drag in the text moves the caret, and only those decide the side again
+	if (overText && (ImGui::IsMouseClicked(ImGuiMouseButton_Left) || ImGui::IsMouseDragging(ImGuiMouseButton_Left))) {
+		caretPastPadding = clickPastPadding ? cursorPos : DocPos(invalidLine, 0);
+	}
 
 	panning &= config.panMode && ImGui::IsMouseDown(ImGuiMouseButton_Middle);
 
@@ -1845,6 +1941,16 @@ void TextEditor::makeBoxSelection(VisPos anchor, VisPos position) {
 	// rows rather than lines so that the box is what it looks like when lines are wrapped
 	auto firstRow = std::min(anchor.row, position.row);
 	auto lastRow = std::max(anchor.row, position.row);
+
+	// the anchor is latched at the click and the rows can shrink under the drag (a reload
+	// between frames); a stale anchor must not ask for rows that no longer exist, cursor by
+	// cursor
+	if (typeSetter.size() == 0) {
+		return;
+	}
+
+	firstRow = std::min(firstRow, typeSetter.size() - 1);
+	lastRow = std::min(lastRow, typeSetter.size() - 1);
 	auto leftColumn = std::min(anchor.column, position.column);
 	auto rightColumn = std::max(anchor.column, position.column);
 
@@ -2267,7 +2373,7 @@ void TextEditor::setCursor(DocPos pos) {
 
 void TextEditor::scrollToLine(size_t line, Scroll alignment, float fraction) {
 	ensureVisiblePos = DocPos(invalidLine, 0);
-	scrollToLineNumber = std::min(line, document.size());
+	scrollToLineNumber = std::min(line, document.size() - 1);
 	scrollToAlignment = alignment;
 	scrollToFraction = fraction;
 
@@ -2775,7 +2881,9 @@ void TextEditor::handleCharacter(ImWchar character) {
 
 	endTransaction(transaction);
 
-	if (CodePoint::isWord(character)) {
+	// a term character starts one as well: "@" is the whole of what tells an at-rule apart, and
+	// waiting for the letter after it would offer the list a glyph late
+	if (CodePoint::isWord(character) || autocomplete.isTermCharacter(character)) {
 		if (!cursors.hasMultiple() && autocomplete.startTyping(cursors)) {
 			makeCursorVisible();
 		}
@@ -2833,7 +2941,12 @@ void TextEditor::removeSelectedLines() {
 	for (auto cursor = cursors.begin(); cursor < cursors.end(); cursor++) {
 		auto start = document.getStartOfLine(cursor->getSelectionStart());
 		auto end = cursor->getSelectionEnd();
-		end = (end.index == 0) ? end : document.getNextLine(end);
+
+		// a selection that stops at the start of a line does not reach into that line, so the line
+		// stays - but a bare cursor sitting at the start of its own line still takes that line with
+		// it, newline included (without the hasSelection test, end would equal start and cutting or
+		// deleting a line from column 0 would remove nothing, an empty line least of all)
+		end = (cursor->hasSelection() && end.index == 0) ? end : document.getNextLine(end);
 		deleteText(transaction, start, end);
 		cursor->update(start, false);
 		cursors.adjustForDelete(cursor, start, end);
@@ -2877,6 +2990,30 @@ void TextEditor::insertLineBelow() {
 	}
 
 	endTransaction(transaction);
+}
+
+
+//
+//	TextEditor::selectionsAreBlanksOnly
+//
+
+bool TextEditor::selectionsAreBlanksOnly() const {
+	// every cursor has to hold a selection that stays on one line and contains only spaces and
+	// tabs - a selection that spans lines carries newlines, and replacing those with a single tab
+	// would join the lines instead of indenting them
+	for (auto& cursor : cursors) {
+		if (!cursor.hasSelection() || cursor.getSelectionStart().line != cursor.getSelectionEnd().line) {
+			return false;
+		}
+
+		auto text = document.getSectionText(cursor.getSelectionStart(), cursor.getSelectionEnd());
+
+		if (text.find_first_not_of(" \t") != std::string::npos) {
+			return false;
+		}
+	}
+
+	return true;
 }
 
 
@@ -3045,7 +3182,7 @@ void TextEditor::toggleComments() {
 			if ((!cursor->hasSelection() || DocPos(line, 0) != cursorEnd) && document[line].size()) {
 				// a line inside an embedded region comments the way that language does, not the
 				// way the host does - /* */ inside an HTML <style> block, <!-- --> outside it
-				auto language = (document[line].embedded && config.language->embedded) ? config.language->embedded : config.language;
+				auto language = config.language->activeLanguage(document[line].embedded);
 				auto comment = language->singleLineComment;
 
 				// skip leading whitespace
@@ -3554,6 +3691,9 @@ void TextEditor::deleteText(std::shared_ptr<Transaction> transaction, DocPos sta
 void TextEditor::SetLanguage(const Language* language) {
 	config.language = language;
 
+	// which palette a region maps to depends on the language, so it has to be resolved again
+	paletteAlpha = -1.0f;
+
 	if (languageChangeCallback) {
 		languageChangeCallback();
 	}
@@ -3613,17 +3753,20 @@ void TextEditor::Cursor::adjustForInsert(DocPos insertStart, DocPos insertEnd) {
 //
 
 TextEditor::DocPos TextEditor::Cursor::adjustCoordinateForDelete(DocPos position, DocPos deleteStart, DocPos deleteEnd) {
-	if (deleteStart.line == deleteEnd.line) {
-		if (position.line == deleteEnd.line) {
-			position.index -= deleteEnd.index - deleteStart.index;
-		}
+	// despite the assumption stated in the header, a position can land inside the deleted range
+	// (another cursor's selection overlapping this one); it collapses onto the start of the
+	// delete instead of underflowing the unsigned arithmetic below
+	if (position < deleteEnd) {
+		return position < deleteStart ? position : deleteStart;
+	}
+
+	if (position.line == deleteEnd.line) {
+		// what sat behind the delete on its last line ends up behind where the delete started
+		position.index = deleteStart.index + (position.index - deleteEnd.index);
+		position.line = deleteStart.line;
 
 	} else {
 		position.line -= deleteEnd.line - deleteStart.line;
-
-		if (position.line == deleteEnd.line) {
-			position.index -= deleteEnd.index;
-		}
 	}
 
 	return position;
@@ -3641,14 +3784,33 @@ void TextEditor::Cursor::adjustForDelete(DocPos deleteStart, DocPos deleteEnd) {
 
 
 //
+//	TextEditor::Cursor::clampToDocument
+//
+
+void TextEditor::Cursor::clampToDocument(const Document& document) {
+	// a cursor can be left past the end of the text when it shrinks underneath (an edit, an
+	// undo, a reload); nothing downstream checks a position against the document, so the one
+	// place that runs every frame before the cursors are used pulls them back in
+	auto newStart = document.normalizePos(start);
+	auto newEnd = document.normalizePos(end);
+
+	if (newStart != start || newEnd != end) {
+		start = newStart;
+		end = newEnd;
+		updated = true;
+	}
+}
+
+
+//
 //	TextEditor::Cursor::ensureNotHidden
 //
 
 void TextEditor::Cursor::ensureNotHidden(const Document& document) {
-	if (document[start.line].foldingState == FoldingState::hidden) {
-		auto line = start.line - 1;
+	if (start.line < document.size() && document[start.line].foldingState == FoldingState::hidden) {
+		auto line = start.line;
 
-		while (document[line].foldingState == FoldingState::hidden) {
+		while (line > 0 && document[line].foldingState == FoldingState::hidden) {
 			line--;
 		}
 
@@ -3657,10 +3819,10 @@ void TextEditor::Cursor::ensureNotHidden(const Document& document) {
 		updated = true;
 	}
 
-	if (document[end.line].foldingState == FoldingState::hidden) {
-		auto line = end.line - 1;
+	if (end.line < document.size() && document[end.line].foldingState == FoldingState::hidden) {
+		auto line = end.line;
 
-		while (document[line].foldingState == FoldingState::hidden) {
+		while (line > 0 && document[line].foldingState == FoldingState::hidden) {
 			line--;
 		}
 
@@ -3803,8 +3965,9 @@ void TextEditor::Cursors::clearUpdated() {
 //
 
 void TextEditor::Cursors::update(const Document& document) {
-	// ensure cursors are not on hidden lines
+	// pull cursors the text shrank away from back inside it, and off hidden lines
 	for (auto& cursor : *this) {
+		cursor.clampToDocument(document);
 		cursor.ensureNotHidden(document);
 	}
 
@@ -4926,7 +5089,7 @@ bool TextEditor::Colorizer::matches(Line::iterator start, Line::iterator end, co
 //	TextEditor::Colorizer::updateLine
 //
 
-TextEditor::LineState TextEditor::Colorizer::updateLine(Line& line, bool& embedded) {
+TextEditor::LineState TextEditor::Colorizer::updateLine(Line& line, uint8_t& embedded) {
 	// initialize local variables
 	auto state = line.state;
 	auto nonWhiteSpace = false;
@@ -4934,11 +5097,14 @@ TextEditor::LineState TextEditor::Colorizer::updateLine(Line& line, bool& embedd
 	auto end = line.end();
 	Iterator lineEnd(line.data() + line.size());
 
+	// the line is drawn in the language it starts in until something below says otherwise
+	line.paletteRegion = embedded;
+
 	// process all glyphs on this line
 	while (glyph < end) {
 		// the language in force here: inside an embedded region (e.g. a <style> block in HTML)
 		// every rule below comes from the embedded language until its closing token shows up
-		auto active = (embedded && language->embedded) ? language->embedded : language;
+		auto active = language->activeLanguage(embedded);
 
 		// start parsing glyphs
 		auto start = glyph;
@@ -4948,16 +5114,44 @@ TextEditor::LineState TextEditor::Colorizer::updateLine(Line& line, bool& embedd
 			// does an embedded region open or close here
 			// only tested at the top level of a line: a region marker inside a comment or a
 			// string is text like any other
-			if (language->embedded) {
+			if (language->embedded.size()) {
 				Iterator tokenEnd = tokenStart;
 
 				if (embedded) {
-					if (language->embeddedEnd && (tokenEnd = language->embeddedEnd(tokenStart, lineEnd)) != tokenStart) {
-						embedded = false;
+					auto& region = language->embedded[embedded - 1];
+
+					if (region.end && (tokenEnd = region.end(tokenStart, lineEnd)) != tokenStart) {
+						embedded = 0;
+
+						// a line that opens with the closing marker ("</script>" on a line of its
+						// own, which is how it is written) is markup and is drawn as markup; the
+						// palette is picked per line, so a line that closes a region halfway is
+						// left to the language it started in
+						auto leading = true;
+
+						for (auto probe = line.begin(); probe < glyph; probe++) {
+							if (!CodePoint::isWhiteSpace(probe->codepoint)) {
+								leading = false;
+								break;
+							}
+						}
+
+						if (leading) {
+							line.paletteRegion = 0;
+						}
 					}
 
-				} else if (language->embeddedStart && (tokenEnd = language->embeddedStart(tokenStart, lineEnd)) != tokenStart) {
-					embedded = true;
+				} else {
+					// first entry that claims this spot wins, so a host language with several of
+					// them (HTML has <style> and <script>) reads them in the order they were added
+					for (size_t i = 0; i < language->embedded.size(); i++) {
+						auto& region = language->embedded[i];
+
+						if (region.start && (tokenEnd = region.start(tokenStart, lineEnd)) != tokenStart) {
+							embedded = static_cast<uint8_t>(i + 1);
+							break;
+						}
+					}
 				}
 
 				if (tokenEnd != tokenStart) {
@@ -5256,7 +5450,7 @@ bool TextEditor::Colorizer::update(const Config& config, Document& document) {
 		language = config.language;
 
 		if (language) {
-			bool embedded = false;
+			uint8_t embedded = 0;
 
 			for (auto line = document.begin(); line < document.end(); line++) {
 				line->embedded = embedded;
@@ -5276,7 +5470,8 @@ bool TextEditor::Colorizer::update(const Config& config, Document& document) {
 				}
 
 				line->state = LineState::inText;
-				line->embedded = false;
+				line->embedded = 0;
+				line->paletteRegion = 0;
 				line->needsColorizing = false;
 			}
 		}
@@ -5286,7 +5481,7 @@ bool TextEditor::Colorizer::update(const Config& config, Document& document) {
 		for (auto line = document.begin(); line < document.end(); line++) {
 			if (line->needsColorizing) {
 				if (language) {
-					bool embedded = line->embedded;
+					uint8_t embedded = line->embedded;
 					auto state = updateLine(*line, embedded);
 					line->needsColorizing = false;
 					auto next = line + 1;
@@ -5297,6 +5492,10 @@ bool TextEditor::Colorizer::update(const Config& config, Document& document) {
 						next->state = state;
 						next->embedded = embedded;
 						next->needsColorizing = true;
+
+						// what a line reserves in front of its glyphs can depend on the language
+						// it is in, so a line that changed language has to be asked again
+						next->needsTypeSetting = true;
 					}
 
 				} else {
@@ -5305,7 +5504,8 @@ bool TextEditor::Colorizer::update(const Config& config, Document& document) {
 					}
 
 					line->state = LineState::inText;
-					line->embedded = false;
+					line->embedded = 0;
+					line->paletteRegion = 0;
 					line->needsColorizing = false;
 				}
 			}
@@ -6059,6 +6259,17 @@ void TextEditor::MiniMap::processLine(
 	// process all
 	while (column < endColumn) {
 		auto& glyph = line[index++];
+
+		// reserved cells carry no glyph, so they end the run the same way a space does
+		if (glyph.padding) {
+			if (column != start && color != Color::whitespace) {
+				row.sections.emplace_back(start, column, color);
+			}
+
+			column += glyph.padding;
+			start = column;
+			color = Color::background;
+		}
 
 		// detect end of section
 		if (glyph.color != color) {
@@ -8383,7 +8594,8 @@ void TextEditor::TypeSetter::wrapLine(Line& line) {
 				}
 			}
 
-			// update column count
+			// update column count (cells reserved in front of this glyph come first)
+			columns += line[i].padding;
 			columns = (codepoint == '\t') ? ((columns / tabSize) + 1) * tabSize : columns + 1;
 
 			if (columns < wordWrapColumns) {
@@ -8459,6 +8671,7 @@ void TextEditor::TypeSetter::updateLine(Line& line) {
 		line.columns = 0;
 
 		for (const auto& glyph : line) {
+			line.columns += glyph.padding;
 			line.columns = (glyph.codepoint == '\t') ? ((line.columns / tabSize) + 1) * tabSize : line.columns + 1;
 		}
 
@@ -8554,6 +8767,10 @@ TextEditor::VisPos TextEditor::TypeSetter::docPos2VisPos(const Document& documen
 		return VisPos(0, 0);
 	}
 
+	// callers hand over raw cursor positions and the text can have shrunk under them since;
+	// nothing on the way here clamps, so every stale position is caught at this door
+	pos = document.normalizePos(pos);
+
 	auto& line = document[pos.line];
 	VisPos visPos(line.row, 0);
 
@@ -8574,8 +8791,13 @@ TextEditor::VisPos TextEditor::TypeSetter::docPos2VisPos(const Document& documen
 				visPos.column = section.indent;
 
 				for (auto glyph = start; glyph < end; glyph++) {
+					visPos.column += glyph->padding;
 					visPos.column = (glyph->codepoint == '\t') ? ((visPos.column / tabSize) + 1) * tabSize : visPos.column + 1;
 				}
+
+				// the padding of the glyph itself is deliberately not added: a position in front of
+				// a glyph is drawn in front of the cells reserved for it, so the caret can be put on
+				// the left of what an overlay draws there instead of being pushed past it
 
 				done = true;
 
@@ -8589,6 +8811,7 @@ TextEditor::VisPos TextEditor::TypeSetter::docPos2VisPos(const Document& documen
 		auto end = line.begin() + pos.index;
 
 		for (auto glyph = line.begin(); glyph < end; glyph++) {
+			visPos.column += glyph->padding;
 			visPos.column = (glyph->codepoint == '\t') ? ((visPos.column / tabSize) + 1) * tabSize : visPos.column + 1;
 		}
 	}
@@ -8607,6 +8830,14 @@ TextEditor::DocPos TextEditor::TypeSetter::visPos2DocPos(const Document& documen
 	}
 
 	auto& row = at(pos.row);
+
+	// the row table can be a frame older than the document (preserving the first visible line
+	// across a re-layout is exactly what asks for it), so a row may name a line the document
+	// no longer has
+	if (row.line >= document.size()) {
+		return DocPos(document.size() - 1, document.back().size());
+	}
+
 	auto& line = document[row.line];
 
 	DocPos docPos;
@@ -8619,7 +8850,7 @@ TextEditor::DocPos TextEditor::TypeSetter::visPos2DocPos(const Document& documen
 	Line::const_iterator start;
 	Line::const_iterator end;
 
-	if (line.sections) {
+	if (line.sections && row.section < line.sections->size()) {
 		const auto& section = line.sections->at(row.section);
 		index = section.startIndex;
 		leftColumn = section.indent;
@@ -8637,17 +8868,33 @@ TextEditor::DocPos TextEditor::TypeSetter::visPos2DocPos(const Document& documen
 		end = line.end();
 	}
 
+	size_t padding = 0;
+
 	for (auto glyph = start; rightColumn < pos.column && glyph < end; glyph++) {
 		leftColumn = rightColumn;
+		padding = glyph->padding;
+		rightColumn = leftColumn + padding;
 		rightColumn = (glyph->codepoint == '\t') ? ((rightColumn / tabSize) + 1) * tabSize : rightColumn + 1;
 		index++;
 	}
 
-	if (rightColumn - leftColumn <= 1) {
+	// past the last glyph of a short row the caret can only go at its end; without this, the
+	// right-distance arithmetic below underflows when that last glyph is a tab
+	if (pos.column > rightColumn) {
+		docPos.index = index;
+		return docPos;
+	}
+
+	// the cells reserved in front of a glyph are not part of it: a column inside them is the
+	// position in front of the glyph, which is where that position's caret is drawn
+	if (padding != 0 && pos.column <= leftColumn + padding) {
+		docPos.index = index - 1;
+
+	} else if (rightColumn - leftColumn - padding <= 1) {
 		docPos.index = index;
 
 	} else {
-		auto leftDiff = pos.column - leftColumn;
+		auto leftDiff = pos.column - (leftColumn + padding);
 		auto rightDiff = rightColumn - pos.column;
 		docPos.index = leftDiff <= rightDiff ? index - 1 : index;
 	}
@@ -8720,13 +8967,20 @@ void TextEditor::TypeSetter::screenPos2DocPos(const Document& document, ImVec2 s
 
 			}
 
+			size_t padding = 0;
+
 			for (auto glyph = start; static_cast<float>(rightColumn) < screenPos.x && glyph < end; glyph++) {
 				leftColumn = rightColumn;
+				padding = glyph->padding;
+				rightColumn = leftColumn + padding;
 				rightColumn = (glyph->codepoint == '\t') ? ((rightColumn / tabSize) + 1) * tabSize : rightColumn + 1;
 				index++;
 			}
 
-			auto leftDiff = screenPos.x - static_cast<float>(leftColumn);
+			// measured from the left edge of the glyph, not of the cells reserved in front of it:
+			// a click on those belongs to the position before the glyph (leftDiff goes negative),
+			// which is where its caret is drawn, and the glyph still splits at its own middle
+			auto leftDiff = screenPos.x - static_cast<float>(leftColumn + padding);
 			auto rightDiff = static_cast<float>(rightColumn) - screenPos.x;
 
 			glyphPos = DocPos(row.line, leftColumn == rightColumn ? index : index - 1);
@@ -8780,6 +9034,49 @@ void TextEditor::AutoComplete::setConfig(const AutoCompleteConfig* config) {
 	}
 
 	active = false;
+}
+
+
+//
+//	TextEditor::AutoComplete::isTermCharacter
+//
+
+bool TextEditor::AutoComplete::isTermCharacter(ImWchar codepoint) const {
+	// the configured glyphs are ASCII punctuation ("-", "@"), so a byte compare is the whole test
+	return codepoint < 128 && configuration.termCharacters.find(static_cast<char>(codepoint)) != std::string::npos;
+}
+
+
+//
+//	TextEditor::AutoComplete::findTermStart
+//
+
+TextEditor::DocPos TextEditor::AutoComplete::findTermStart(Document& document, DocPos from) const {
+	const auto& line = document[from.line];
+	auto index = from.index;
+
+	while (index > 0 && (CodePoint::isWord(line[index - 1].codepoint) || isTermCharacter(line[index - 1].codepoint))) {
+		index--;
+	}
+
+	return DocPos(from.line, index);
+}
+
+
+//
+//	TextEditor::AutoComplete::findTermEnd
+//
+
+TextEditor::DocPos TextEditor::AutoComplete::findTermEnd(Document& document, DocPos from) const {
+	const auto& line = document[from.line];
+	auto size = line.size();
+	auto index = from.index;
+
+	while (index < size && (CodePoint::isWord(line[index].codepoint) || isTermCharacter(line[index].codepoint))) {
+		index++;
+	}
+
+	return DocPos(from.line, index);
 }
 
 
@@ -8893,7 +9190,7 @@ bool TextEditor::AutoComplete::render(Document& document, Cursors& cursors, Type
 			requestActivation = false;
 
 			// capture locations
-			startLocation = document.findWordStart(currentLocation, true);
+			startLocation = findTermStart(document, currentLocation);
 
 			// update the autocomplete state
 			updateState(document, language);
@@ -8931,7 +9228,7 @@ bool TextEditor::AutoComplete::render(Document& document, Cursors& cursors, Type
 
 		} else {
 			// see if cursor moved away from current word
-			auto newStart = document.findWordStart(newLocation, true);
+			auto newStart = findTermStart(document, newLocation);
 
 			if (newStart == startLocation) {
 				currentLocation = newLocation;
@@ -10936,6 +11233,58 @@ void TextEditor::updatePalettes() {
 		palette[i] = ImGui::GetColorU32(paletteBase[i]);
 		miniMapPalette[i] = ImGui::GetColorU32(paletteBase[i], miniMapAlpha);
 	}
+
+	// one working palette per language this document can hold at once: the host language and
+	// whatever it embeds, resolved here so rendering a line is an index and nothing more
+	auto regions = (config.language == nullptr) ? 1 : config.language->embedded.size() + 1;
+	regionPalettes.resize(regions);
+
+	for (size_t region = 0; region < regions; region++) {
+		auto source = &paletteBase;
+
+		if (config.language) {
+			auto language = config.language->activeLanguage(region);
+
+			for (auto& entry : languagePalettes) {
+				if (entry.first == language) {
+					source = &entry.second;
+					break;
+				}
+			}
+		}
+
+		for (size_t i = 0; i < static_cast<size_t>(Color::count); i++) {
+			regionPalettes[region][i] = ImGui::GetColorU32((*source)[i]);
+		}
+	}
+}
+
+
+//
+//	TextEditor::SetLanguagePalette
+//
+
+void TextEditor::SetLanguagePalette(const Language* language, const Palette& newPalette) {
+	for (auto& entry : languagePalettes) {
+		if (entry.first == language) {
+			entry.second = newPalette;
+			paletteAlpha = -1.0f;
+			return;
+		}
+	}
+
+	languagePalettes.emplace_back(language, newPalette);
+	paletteAlpha = -1.0f;
+}
+
+
+//
+//	TextEditor::ClearLanguagePalettes
+//
+
+void TextEditor::ClearLanguagePalettes() {
+	languagePalettes.clear();
+	paletteAlpha = -1.0f;
 }
 
 

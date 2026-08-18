@@ -467,8 +467,20 @@ public:
 		inline ImU32 get(Color color) const { return at(static_cast<size_t>(color)); }
 	};
 
+	// defined further down, but a palette can belong to one
+	struct Language;
+
 	inline void SetPalette(const Palette& newPalette) { paletteBase = newPalette; paletteAlpha = -1.0f; }
 	inline const Palette& GetPalette() const { return paletteBase; }
+
+	// a palette for the glyphs of one language, so a document that holds more than one at a time
+	// (RCSS in a <style> block, Lua in a <script> one) can colour each the way that language is
+	// read on its own; the language of the editor itself is looked up here too
+	// only glyphs use it - background, cursor, selection, whitespace markers and line numbers stay
+	// on the palette above, or a document would change colour halfway down
+	// languages with no palette of their own fall back to it as well
+	void SetLanguagePalette(const Language* language, const Palette& newPalette);
+	void ClearLanguagePalettes();
 	static inline void SetDefaultPalette(const Palette& aValue) { defaultPalette = aValue; }
 	static inline Palette& GetDefaultPalette() { return defaultPalette; }
 
@@ -499,6 +511,10 @@ public:
 
 		// maintained by the TypeSetter overlay
 		BreakOption breakOption = BreakOption::undefined;
+
+		// empty cells the layout leaves in front of this glyph for an integrator to draw in
+		// maintained by the glyph padding callback (see SetGlyphPaddingCallback)
+		uint8_t padding = 0;
 
 		// squiggle reference
 		size_t squiggle = 0;
@@ -614,14 +630,26 @@ public:
 		// if a token is found, function should return an iterator to the character after the token and set the color
 		std::function<Iterator(Iterator start, Iterator end, Color& color)> customTokenizer;
 
-		// embedded language support (e.g. CSS inside an HTML <style> block)
-		// the two tokenizers detect where such a region opens and closes in the host language
-		// everything in between is colored (and commented) as the embedded language, across lines
+		// embedded language support (e.g. CSS inside an HTML <style> block, Lua inside <script>)
+		// the two tokenizers of an entry detect where that region opens and closes in the host
+		// language; everything in between is colored (and commented) as that entry's language,
+		// across lines
 		// functions should return an iterator to the character after the detected token
 		// returning start means no token was found
-		const Language* embedded = nullptr;
-		std::function<Iterator(Iterator start, Iterator end)> embeddedStart;
-		std::function<Iterator(Iterator start, Iterator end)> embeddedEnd;
+		// only one region can be open at a time and the entries are tried in order, so a host
+		// language can carry several of them (Regions below are 1-based indices into this list)
+		struct EmbeddedLanguage {
+			const Language* language = nullptr;
+			std::function<Iterator(Iterator start, Iterator end)> start;
+			std::function<Iterator(Iterator start, Iterator end)> end;
+		};
+
+		std::vector<EmbeddedLanguage> embedded;
+
+		// the language in force in a region (0 is the host language itself)
+		inline const Language* activeLanguage(size_t region) const {
+			return (region != 0 && region <= embedded.size()) ? embedded[region - 1].language : this;
+		}
 
 		// predefined language definitions
 		static const Language* C();
@@ -699,6 +727,15 @@ public:
 		// see if single suggestions are automatically inserted
 		// this only works when triggered manually
 		bool autoInsertSingleSuggestions = false;
+
+		// glyphs that keep a term going even though the editor does not count them as word
+		// characters: "-" for `font-size` and `data-model`, "@" for `@keyframes`
+		// without them a term restarts at the dash, so the search term handed to the callback is
+		// "size" with the property it belongs to already out of reach - and what the accepted
+		// suggestion replaces would be that tail alone
+		// this is completion only: what a double click selects and what ctrl+arrow steps over are
+		// the editor's own word rules and stay as they are
+		std::string termCharacters;
 
 		// delay in milliseconds between autocomplete trigger and suggestions popup
 		std::chrono::milliseconds triggerDelay{200};
@@ -791,8 +828,29 @@ public:
 
 	inline void ClearOverlayRenderer() { SetOverlayRenderer(nullptr); }
 
+	// empty cells reserved in front of a glyph, so an overlay can draw a mark there instead of
+	// over the text (a colour swatch, a picture mark); they take part in every column calculation
+	// and behave like a tab that carries no glyph
+	// the position in front of the glyph is drawn in front of them, so the caret can be put on the
+	// left of the mark and a click on the mark lands there rather than being pushed past it
+	// the callback is asked for a line whenever that line is (re)type-set, which is every line of
+	// a document that was just loaded and the changed ones after that
+	// text is the line as UTF-8, padding is one entry per glyph on it (zeroed before the call)
+	inline void SetGlyphPaddingCallback(std::function<void(size_t line, const std::string& text, std::vector<uint8_t>& padding, void* userData)> callback, void* userData=nullptr) {
+		glyphPaddingCallback = callback;
+		glyphPaddingUserData = userData;
+	}
+
+	inline void ClearGlyphPaddingCallback() { SetGlyphPaddingCallback(nullptr); }
+
 	// see if a line starts inside an embedded language region (see Language::embedded)
-	inline bool IsLineEmbedded(size_t line) const { return document[normalizeLine(line)].embedded; }
+	inline bool IsLineEmbedded(size_t line) const { return document[normalizeLine(line)].embedded != 0; }
+
+	// the language a line is colored with: the host language, or the embedded one when the line
+	// starts inside a region - which is what tells a <style> block from a <script> one
+	inline const Language* GetLineLanguage(size_t line) const {
+		return (config.language == nullptr) ? nullptr : config.language->activeLanguage(document[normalizeLine(line)].embedded);
+	}
 
 	// support functions for unicode codepoints
 	struct CodePoint {
@@ -1052,8 +1110,15 @@ protected:
 		bool needsColorizing = true;
 		LineState state = LineState::inText;
 
-		// set when this line starts inside an embedded language region (see Language::embedded)
-		bool embedded = false;
+		// which embedded language region this line starts in, 1-based, 0 for the host language
+		// (see Language::embedded)
+		uint8_t embedded = 0;
+
+		// which language's palette the line is drawn in, same numbering: normally the one above,
+		// but a line whose first token closes the region is the host's markup rather than the
+		// embedded language ("</script>" is a tag, not a Lua keyword) and the palette is picked
+		// per line (see SetLanguagePalette)
+		uint8_t paletteRegion = 0;
 
 		// line folding state maintained by the LineFold overlay
 		FoldingState foldingState = FoldingState::visible;
@@ -1178,6 +1243,9 @@ protected:
 		// (these functions assume that insert or delete points are before the cursor)
 		void adjustForInsert(DocPos insertStart, DocPos insertEnd);
 		void adjustForDelete(DocPos deleteStart, DocPos deleteEnd);
+
+		// pull a cursor the text shrank away from back inside the document
+		void clampToDocument(const Document& document);
 
 		// ensure cursor is not on hidden line
 		void ensureNotHidden(const Document& document);
@@ -1363,9 +1431,9 @@ protected:
 
 	private:
 		// update color in a single line
-		// embedded is in/out: it says whether the line starts inside an embedded region
-		// and comes back saying whether the next line does
-		LineState updateLine(Line& line, bool& embedded);
+		// embedded is in/out: it says which embedded region the line starts in (0 for none)
+		// and comes back saying which one the next line starts in
+		LineState updateLine(Line& line, uint8_t& embedded);
 
 		// see if string matches part of line
 		static bool matches(Line::iterator start, Line::iterator end, const std::string_view& text);
@@ -1622,6 +1690,12 @@ protected:
 		inline DocPos getStart() const { return startLocation; }
 		inline std::string getReplacement() { return currentSelection < state.suggestions.size() ? state.suggestions[currentSelection] : ""; }
 
+		// the term under a position, term characters included (see AutoCompleteConfig)
+		// with no term characters configured these are findWordStart/findWordEnd in word-only mode
+		bool isTermCharacter(ImWchar codepoint) const;
+		DocPos findTermStart(Document& document, DocPos from) const;
+		DocPos findTermEnd(Document& document, DocPos from) const;
+
 	private:
 		// properties
 		bool configured = false;
@@ -1667,6 +1741,9 @@ protected:
 
 	// update editor state after changes caused by API calls or user interactions
 	bool updateState();
+
+	// ask the app what each changed line reserves in front of its glyphs
+	void updateGlyphPadding();
 
 	// ask the app for a ghost suggestion at the caret, and put the last one into the document
 	void updateInlineSuggestion();
@@ -1774,6 +1851,7 @@ protected:
 	void insertLineBelow();
 
 	// transform selected lines
+	bool selectionsAreBlanksOnly() const;
 	void indentLines();
 	void deindentLines();
 	void moveUpLines();
@@ -1874,6 +1952,30 @@ protected:
 	std::function<void(const Overlay&)> overlayCallback;
 	void* overlayUserData = nullptr;
 
+	// cells reserved in front of glyphs (see SetGlyphPaddingCallback); the buffer is a member so
+	// asking a line what it reserves does not allocate
+	std::function<void(size_t, const std::string&, std::vector<uint8_t>&, void*)> glyphPaddingCallback;
+	void* glyphPaddingUserData = nullptr;
+	std::vector<uint8_t> glyphPaddingBuffer;
+
+	// which side of those cells the caret is drawn on. both sides of them are the same position
+	// in the document - the cells hold no glyph - so nothing in the document can say whether the
+	// caret belongs in front of what an overlay draws there or right against the glyph behind it.
+	// the click that put the caret there is what says, the way an editor puts the caret on the
+	// side of an inlay that was clicked; invalidLine means the usual side, in front of them.
+	DocPos caretPastPadding{invalidLine, 0};
+
+	// how many cells are reserved in front of the glyph at this position; zero past the end of
+	// the line, which is where the caret sits often enough to be worth not being a special case
+	inline size_t paddingAt(DocPos pos) const {
+		if (pos.line >= document.size()) {
+			return 0;
+		}
+
+		auto& line = document[pos.line];
+		return pos.index < line.size() ? line[pos.index].padding : 0;
+	}
+
 	std::function<void(PopupData& data)> lineNumberContextMenuCallback;
 	std::function<void(PopupData& data)> textContextMenuCallback;
 	std::function<void(PopupData& data)> textHoverCallback;
@@ -1934,4 +2036,14 @@ protected:
 	Palette palette;
 	Palette miniMapPalette;
 	float paletteAlpha;
+
+	// what the app registered per language, and the working copy of it for every region the
+	// current language can hold (index 0 is the host language, see Language::embedded)
+	std::vector<std::pair<const Language*, Palette>> languagePalettes;
+	std::vector<Palette> regionPalettes;
+
+	// the palette a line's glyphs are drawn with
+	inline const Palette& linePalette(const Line& line) const {
+		return (line.paletteRegion < regionPalettes.size()) ? regionPalettes[line.paletteRegion] : palette;
+	}
 };
