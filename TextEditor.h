@@ -1780,6 +1780,7 @@ protected:
 	void paste();
 	void undo();
 	void redo();
+	void makeChangeVisible();
 
 	// access cursor locations
 	DocPos getCursorPosition(size_t cursor) const;

@@ -2227,7 +2227,7 @@ void TextEditor::paste() {
 void TextEditor::undo() {
 	if (transactions.canUndo()) {
 		transactions.undo(config, document, cursors);
-		makeCursorVisible();
+		makeChangeVisible();
 	}
 }
 
@@ -2239,7 +2239,29 @@ void TextEditor::undo() {
 void TextEditor::redo() {
 	if (transactions.canRedo()) {
 		transactions.redo(config, document, cursors);
-		makeCursorVisible();
+		makeChangeVisible();
+	}
+}
+
+
+//
+//	TextEditor::makeChangeVisible
+//
+
+void TextEditor::makeChangeVisible() {
+	// An undo/redo can land anywhere in the document, so makeCursorVisible on its own is not
+	// enough: it only nudges the view by a row or two, and updateState overrules it right after
+	// (it preserves the first visible line across the re-layout the change causes, and only an
+	// explicit scroll request survives that). So ask for a centred scroll whenever the line the
+	// change is on sits outside the view, and leave the view alone when it is already there.
+	makeCursorVisible();
+
+	auto line = cursors.getCurrent().getInteractiveEnd().line;
+	auto firstLine = visPos2DocPos(VisPos(firstVisibleRow, 0)).line;
+	auto lastLine = visPos2DocPos(VisPos(lastVisibleRow, 0)).line;
+
+	if (line < firstLine || line > lastLine) {
+		scrollToLine(line, Scroll::alignMiddle);
 	}
 }
 
@@ -3176,6 +3198,73 @@ void TextEditor::toggleComments() {
 	for (auto cursor = cursors.begin(); cursor < cursors.end(); cursor++) {
 		auto cursorStart = cursor->getSelectionStart();
 		auto cursorEnd = cursor->getSelectionEnd();
+
+		// a selection that stays inside one line comments out just what is selected; a selection
+		// that spans lines still comments whole lines. Only a block comment can do this: a line
+		// comment would take the rest of the line with it instead of the selection.
+		if (cursorStart.line == cursorEnd.line && cursorStart.index != cursorEnd.index) {
+			auto line = cursorStart.line;
+			auto language = config.language->activeLanguage(document[line].embedded);
+
+			if (language->commentStart.size() && language->commentEnd.size()) {
+				auto& commentStart = language->commentStart;
+				auto& commentEnd = language->commentEnd;
+				auto start = cursorStart.index;
+				auto finish = cursorEnd.index;
+
+				auto wrapped = finish >= start + commentStart.size() + commentEnd.size() &&
+					matchesAt(line, start, commentStart) &&
+					matchesAt(line, finish - commentEnd.size(), commentEnd);
+
+				if (wrapped) {
+					// the closing token first: taking the opening one out would move it
+					auto endOfText = finish - commentEnd.size();
+
+					if (endOfText > start + commentStart.size() && document[line][endOfText - 1].codepoint == ' ') {
+						endOfText--;
+					}
+
+					deleteText(transaction, DocPos(line, endOfText), DocPos(line, finish));
+					cursors.adjustForDelete(cursor, DocPos(line, endOfText), DocPos(line, finish));
+
+					auto startOfText = start + commentStart.size();
+
+					if (startOfText < document[line].size() && document[line][startOfText].codepoint == ' ') {
+						startOfText++;
+					}
+
+					deleteText(transaction, DocPos(line, start), DocPos(line, startOfText));
+					cursors.adjustForDelete(cursor, DocPos(line, start), DocPos(line, startOfText));
+
+					finish -= (finish - endOfText) + (startOfText - start);
+
+				} else {
+					auto insertStart = DocPos(line, finish);
+					auto insertEnd = insertText(transaction, insertStart, " " + commentEnd);
+					cursors.adjustForInsert(cursor, insertStart, insertEnd);
+
+					insertStart = DocPos(line, start);
+					insertEnd = insertText(transaction, insertStart, commentStart + " ");
+					cursors.adjustForInsert(cursor, insertStart, insertEnd);
+
+					finish += commentStart.size() + commentEnd.size() + 2;
+				}
+
+				// the selection keeps hold of the text it just commented, tokens included, so the
+				// same shortcut pressed again takes them back off
+				auto selectionStart = DocPos(line, start);
+				auto selectionEnd = DocPos(line, finish);
+
+				if (cursor->getInteractiveStart() <= cursor->getInteractiveEnd()) {
+					cursor->update(selectionStart, selectionEnd);
+
+				} else {
+					cursor->update(selectionEnd, selectionStart);
+				}
+
+				continue;
+			}
+		}
 
 		// process all lines in this cursor
 		for (auto line = cursorStart.line; line <= cursorEnd.line; line++) {
