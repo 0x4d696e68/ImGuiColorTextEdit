@@ -1502,6 +1502,7 @@ void TextEditor::handleKeyboardInputs() {
 		// file is the Find All button, and the chord belongs to whatever the integrator uses for
 		// searching across files
 		else if (ImGui::Shortcut(ImGuiMod_Ctrl | ImGuiKey_G, ImGuiInputFlags_Repeat)) { findNext(); }
+		else if (ImGui::Shortcut(ImGuiKey_F3, ImGuiInputFlags_Repeat)) { findNext(); }
 
 		// autocomplete support
 		else if (!config.readOnly && ImGui::Shortcut(autocomplete.getTriggerShortcut())) {
@@ -6019,7 +6020,7 @@ void TextEditor::renderFindReplace() {
 
 		if (ImGui::IsWindowFocused() &&
 			!disableFindButtons &&
-			ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_G)) {
+			(ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_G) || ImGui::IsKeyChordPressed(ImGuiKey_F3))) {
 
 			ImGui::SetWindowFocus(nullptr);
 			find();
@@ -6091,6 +6092,37 @@ void TextEditor::selectAllOccurrencesOf(const std::string_view& text, bool caseS
 
 	} else {
 		cursors.clearAdditional(true);
+	}
+}
+
+
+//
+//	TextEditor::FindAllOccurrencesOf
+//
+
+void TextEditor::FindAllOccurrencesOf(const std::string_view& text, bool caseSensitive, bool wholeWord, size_t maximum, std::vector<DocSelection>& result) const {
+	if (text.empty()) {
+		return;
+	}
+
+	DocPos start, end;
+
+	if (!document.findText(DocPos(0, 0), text, caseSensitive, wholeWord, start, end)) {
+		return;
+	}
+
+	auto first = start;
+	result.emplace_back(start, end);
+
+	while (result.size() < maximum) {
+		DocPos nextStart, nextEnd;
+
+		if (!document.findText(end, text, caseSensitive, wholeWord, nextStart, nextEnd) || nextStart == first) {
+			break;
+		}
+
+		result.emplace_back(nextStart, nextEnd);
+		end = nextEnd;
 	}
 }
 

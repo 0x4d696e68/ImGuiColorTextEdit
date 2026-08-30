@@ -273,6 +273,12 @@ public:
 	inline void SetReplaceButtonLabel(const std::string_view& label) { replaceButtonLabel = label; }
 	inline void SetReplaceAllButtonLabel(const std::string_view& label) { replaceAllButtonLabel = label; }
 	inline bool HasFindString() const { return findText.size(); }
+	inline bool IsFindReplaceVisible() const { return findReplaceVisible; }
+	inline const std::string& GetFindString() const { return findText; }
+	inline bool IsFindCaseSensitive() const { return caseSensitiveFind; }
+	inline bool IsFindWholeWord() const { return wholeWordFind; }
+
+	void FindAllOccurrencesOf(const std::string_view& text, bool caseSensitive, bool wholeWord, size_t maximum, std::vector<DocSelection>& result) const;
 	inline void FindNext() { findNext(); }
 	inline void FindAll() { findAll(); }
 
